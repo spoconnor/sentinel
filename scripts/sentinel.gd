@@ -13,6 +13,7 @@ extends Node3D
 @onready var eye_light: SpotLight3D = $HeadPivot/EyeLight
 
 var _player: Node3D
+var _player_head: Node3D
 var _locked_time: float = 0.0
 var _turn_elapsed: float = 0.0
 var _action_elapsed: float = 0.0
@@ -24,34 +25,35 @@ func _ready() -> void:
 		var root := get_tree().current_scene
 		if root != null:
 			_player = root.get_node_or_null("Player") as Node3D
+	if _player != null:
+		_player_head = _player.get_node_or_null("CameraPivot/Camera3D") as Node3D
 	_create_debug_vision_mesh()
 
 func _process(delta: float) -> void:
-	if timer > 0.0:
-		_turn_elapsed += delta
-		while _turn_elapsed >= timer:
-			rotate_y(deg_to_rad(step))
-			_turn_elapsed -= timer
-	elif rotation_speed != 0.0:
-		rotate_y(rotation_speed * delta)
-
 	if _player == null or head_pivot == null:
 		return
 
 	var head_pos := head_pivot.global_position
-	var to_player := _player.global_position - head_pos
-	var distance := to_player.length()
-	var sees_player := false
-	var sees_square := false
 	var forward := -head_pivot.global_transform.basis.z.normalized()
+	var sees_body := _can_see_point(_player.global_position, head_pos, forward, [_player, self])
+	var sees_head := false
+	if _player_head != null:
+		sees_head = _can_see_point(_player_head.global_position, head_pos, forward, [_player, self])
+	var sees_player := sees_body or sees_head
 
-	if distance <= scan_range and distance > 0.001:
-		var dir := to_player / distance
-		var cone_dot := forward.dot(dir)
-		if cone_dot > cone_dot_threshold and _has_line_of_sight(head_pos, _player.global_position, [_player, self]):
-			sees_player = true
-			var square_pos := _player.global_position - Vector3(0, 1.65, 0)
-			sees_square = _has_line_of_sight(head_pos, square_pos, [_player, self])
+	var sees_square := false
+	if sees_player:
+		var square_pos := _player.global_position - Vector3(0, 1.65, 0)
+		sees_square = _can_see_point(square_pos, head_pos, forward, [_player, self])
+
+	if not sees_player:
+		if timer > 0.0:
+			_turn_elapsed += delta
+			while _turn_elapsed >= timer:
+				rotate_y(deg_to_rad(step))
+				_turn_elapsed -= timer
+		elif rotation_speed != 0.0:
+			rotate_y(rotation_speed * delta)
 
 	if sees_player:
 		_locked_time += delta
@@ -62,6 +64,16 @@ func _process(delta: float) -> void:
 	_update_debug_vision_visibility()
 	_report_contact(sees_player, sees_square)
 	_try_action(delta, forward, head_pos, sees_player, sees_square)
+
+func _can_see_point(point: Vector3, head_pos: Vector3, forward: Vector3, exclude_nodes: Array) -> bool:
+	var to_point := point - head_pos
+	var distance := to_point.length()
+	if distance > scan_range or distance <= 0.001:
+		return false
+	var dir := to_point / distance
+	if forward.dot(dir) <= cone_dot_threshold:
+		return false
+	return _has_line_of_sight(head_pos, point, exclude_nodes)
 
 func _has_line_of_sight(from: Vector3, to: Vector3, exclude_nodes: Array) -> bool:
 	var p := PhysicsRayQueryParameters3D.create(from, to)

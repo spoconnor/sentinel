@@ -21,6 +21,7 @@ const ENERGY_MEANIE := 1
 
 const WATCH_LOCK_SECONDS := 5.0
 const WATCH_DRAIN_INTERVAL := 5.0
+const WATCH_ABSORB_INTERVAL := 5.0
 const WATCH_CONTACT_STALE_SECONDS := 0.7
 const GRID_SIZE := 31
 
@@ -41,6 +42,7 @@ var _lost: bool = false
 
 var _watcher_contacts: Dictionary = {}
 var _watcher_debug_targets: Dictionary = {}
+var _watcher_absorb_ready_at: Dictionary = {}
 var _watch_seen_timer: float = 0.0
 var _watch_drain_timer: float = 0.0
 var _meanie_cooldowns: Dictionary = {}
@@ -724,6 +726,7 @@ func watcher_attempt_action(
 		return
 
 	var watcher_id := watcher.get_instance_id()
+	var now := Time.get_ticks_msec() * 0.001
 	_watcher_debug_targets[watcher_id] = "none"
 
 	if watcher_kind != "meanie" and sees_player and not sees_square:
@@ -734,9 +737,15 @@ func watcher_attempt_action(
 
 	var target := _find_absorb_target(watcher, forward, head_pos, scan_range, cone_threshold)
 	if target != null:
+		var ready_at := float(_watcher_absorb_ready_at.get(watcher_id, 0.0))
+		if now < ready_at:
+			_watcher_debug_targets[watcher_id] = "cooldown"
+			_update_debug_ui()
+			return
 		_watcher_debug_targets[watcher_id] = String(target.get_meta("object_kind", "target"))
 		_degrade_object_one_energy(target)
 		_spawn_random_tree()
+		_watcher_absorb_ready_at[watcher_id] = now + WATCH_ABSORB_INTERVAL
 		_update_debug_ui()
 		return
 
@@ -749,41 +758,80 @@ func _find_absorb_target(watcher: Node3D, forward: Vector3, head_pos: Vector3, s
 		var obj := child as Node3D
 		if obj == null or obj == watcher:
 			continue
-		var kind := String(obj.get_meta("object_kind", ""))
-		if kind != "robot" and kind != "boulder":
-			continue
-		if kind == "robot" and _active_robot != null and obj == _active_robot:
+		if int(obj.get_meta("stack_level", 0)) != 0:
 			continue
 
-		var energy := _energy_cost_for_node(obj)
-		if energy <= 1:
+		var kind0 := String(obj.get_meta("object_kind", ""))
+		if kind0 != "robot" and kind0 != "boulder":
 			continue
 
-		var target_pos := obj.global_position
-		var to_target := target_pos - head_pos
-		var distance := to_target.length()
-		if distance > scan_range or distance <= 0.001:
+		var candidate := obj
+		var boulder_chain: Array[Node3D] = []
+		if kind0 == "boulder":
+			boulder_chain.append(obj)
+			while true:
+				var stacked := _get_stacked_on_boulder(candidate)
+				if stacked == null:
+					break
+				candidate = stacked
+				var stacked_kind := String(candidate.get_meta("object_kind", ""))
+				if stacked_kind == "boulder":
+					boulder_chain.append(candidate)
+
+		var kind := String(candidate.get_meta("object_kind", ""))
+		var level := int(candidate.get_meta("stack_level", 0))
+		var stacked_tree_absorbable := kind == "tree" and level == 1
+
+		if kind != "robot" and kind != "boulder" and not stacked_tree_absorbable:
 			continue
-		var dir := to_target / distance
-		if forward.dot(dir) <= cone_threshold:
+		if kind == "robot" and _active_robot != null and candidate == _active_robot:
 			continue
-		if not _has_world_line_of_sight(head_pos, target_pos, [watcher, obj]):
+
+		var energy := _energy_cost_for_node(candidate)
+		if not stacked_tree_absorbable and energy <= 1:
 			continue
+
+		var target_pos := candidate.global_position
+		var distance := target_pos.distance_to(head_pos)
+		var has_visibility := _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, candidate)
+		if not has_visibility and stacked_tree_absorbable:
+			for b in boulder_chain:
+				if _watcher_can_see_target_point(head_pos, forward, b.global_position, scan_range, cone_threshold, watcher, b):
+					has_visibility = true
+					distance = head_pos.distance_to(b.global_position)
+					break
+		if not has_visibility:
+			continue
+
 		if distance < best_dist:
 			best_dist = distance
-			best = obj
+			best = candidate
 	return best
 
-func _has_world_line_of_sight(from: Vector3, to: Vector3, exclude_nodes: Array) -> bool:
+func _watcher_can_see_target_point(head_pos: Vector3, forward: Vector3, point: Vector3, scan_range: float, cone_threshold: float, watcher: Node3D, target: Node3D) -> bool:
+	var to_target := point - head_pos
+	var distance := to_target.length()
+	if distance > scan_range or distance <= 0.001:
+		return false
+	var dir := to_target / distance
+	if forward.dot(dir) <= cone_threshold:
+		return false
+	return _has_world_line_of_sight(head_pos, point, watcher, target)
+
+func _has_world_line_of_sight(from: Vector3, to: Vector3, watcher: Node3D, target: Node3D) -> bool:
 	var p := PhysicsRayQueryParameters3D.create(from, to)
 	p.collide_with_areas = false
 	p.collide_with_bodies = true
 	p.exclude = []
-	for n in exclude_nodes:
-		if n is Node3D:
-			p.exclude.append((n as Node3D).get_rid())
+	if watcher != null:
+		p.exclude.append(watcher.get_rid())
 	var hit := get_world_3d().direct_space_state.intersect_ray(p)
-	return hit.is_empty()
+	if hit.is_empty():
+		return false
+	var collider := hit.get("collider") as Node
+	if collider == null or target == null:
+		return false
+	return target.is_ancestor_of(collider) or collider == target
 
 func _degrade_object_one_energy(node: Node3D) -> void:
 	if node == null or _build_root == null:
@@ -793,6 +841,13 @@ func _degrade_object_one_energy(node: Node3D) -> void:
 	var square := Vector2i(int(node.get_meta("grid_x", 0)), int(node.get_meta("grid_z", 0)))
 	var level := int(node.get_meta("stack_level", 0))
 	var support := _find_node_by_instance_id(int(node.get_meta("support_boulder_id", -1)))
+	var placement := _normalize_degrade_placement(square, level, support)
+	level = placement["level"]
+	support = placement["support"]
+
+	if kind == "tree" and level == 1:
+		node.queue_free()
+		return
 
 	if kind == "robot":
 		var boulder := _create_boulder_node(node.position + Vector3(0, 0.5, 0), square, level, support)
@@ -807,6 +862,11 @@ func _degrade_object_one_energy(node: Node3D) -> void:
 		_build_root.add_child(tree)
 		node.queue_free()
 		return
+
+func _normalize_degrade_placement(_square: Vector2i, level: int, support: Node3D) -> Dictionary:
+	if level == 1 and support != null and support.is_in_group(GROUP_BUILD_BOULDER):
+		return {"level": 1, "support": support}
+	return {"level": 0, "support": null}
 
 func _find_node_by_instance_id(id: int) -> Node3D:
 	if id < 0 or _build_root == null:
@@ -945,6 +1005,7 @@ func _update_watcher_pressure(delta: float) -> void:
 		if now - float(e.get("time", 0.0)) > WATCH_CONTACT_STALE_SECONDS:
 			_watcher_contacts.erase(k)
 			_watcher_debug_targets.erase(k)
+			_watcher_absorb_ready_at.erase(k)
 
 	var sees_player := false
 	var sees_square := false

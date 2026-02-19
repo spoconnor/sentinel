@@ -6,7 +6,7 @@ const GROUP_TRANSFER_ROBOT := "transfer_robot"
 
 @export var seed_bcd: int = 0x0000
 @export var use_generated_bcd: bool = false
-@export var landscape_bcd: int = 0x0100
+@export var landscape_bcd: int = 0x0000
 @export var tile_size: float = 1.6
 @export var height_scale: float = 0.8
 

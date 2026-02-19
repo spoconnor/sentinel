@@ -88,18 +88,46 @@ When player is seen and player square is also seen:
 - Each drained unit spawns one random Tree somewhere valid on landscape.
 - Drain can continue through 0 and ends game at -1.
 
-## 12. World Absorption by Watchers (Classic-style Step Degrade)
+## 12. World Absorption by Watchers (Implemented)
 
-Sentinel/Sentries can absorb visible objects with energy > 1.
-Target set includes:
+Sentinel/Sentries absorb world objects in discrete steps under visibility rules.
+
+### 12.1 Timing
+
+- Absorption is limited to **one degradation step every 5 seconds per watcher**.
+- A watcher on cooldown cannot apply another degradation step until cooldown expires.
+
+### 12.2 Valid Absorption Targets
+
+Primary target classes:
 - Robot (excluding the active player robot)
 - Boulder
 
-Degrade is one energy-step at a time:
+Stack behavior:
+- Target selection walks upward from a base boulder to the **topmost stacked object**.
+- Degradation proceeds **top to bottom**, one step at a time.
+- A stacked Tree on top of one or more boulders is absorbable/removable.
+
+### 12.3 Visibility Rule for Stacked Trees
+
+A stacked Tree can be absorbed if watcher has line-of-sight to:
+- the stacked Tree itself, or
+- any supporting Boulder in that stack chain.
+
+### 12.4 Degradation Steps
+
 - Robot (3) -> Boulder (2)
 - Boulder (2) -> Tree (1)
+- Stacked Tree (1) selected as top stack target -> removed
 
-For each absorbed unit, watcher also spawns one random Tree on valid free square (energy redistribution behavior).
+### 12.5 Placement-Safety Constraint
+
+- Degradation output is normalized so objects are never left stacked on invalid supports.
+- Stacked output remains stacked only when support is a valid Boulder; otherwise output is forced to ground level.
+
+### 12.6 Energy Redistribution
+
+- For each watcher absorption step, one random Tree is spawned on a valid free square.
 
 ## 13. Partial-Lock Meanie Rule
 
