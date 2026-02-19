@@ -1,0 +1,110 @@
+[gd_scene format=3 uid="uid://bhxt6y2a4p66t"]
+
+[ext_resource type="Script" uid="uid://cscsetbflq68x" path="res://scripts/player_controller.gd" id="1_0xm2m"]
+[ext_resource type="Script" uid="uid://ikxkhijk4oj3" path="res://scripts/sentinel.gd" id="1_ig7tw"]
+[ext_resource type="Script" uid="uid://bwipdxen8tdxa" path="res://scripts/landscape_generator.gd" id="3_h2yge"]
+
+[sub_resource type="Environment" id="Environment_7dm0k"]
+background_mode = 1
+ambient_light_source = 3
+ambient_light_color = Color(0.5, 0.56, 0.62, 1)
+ambient_light_sky_contribution = 0.2
+fog_enabled = true
+fog_light_color = Color(0.63, 0.68, 0.72, 1)
+fog_density = 0.0025
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_0xm2m"]
+albedo_color = Color(0.31, 0.36, 0.28, 1)
+roughness = 0.95
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_7dm0k"]
+size = Vector2(120, 120)
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_7dm0k"]
+size = Vector3(60, 0.5, 60)
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_7dm0k"]
+radius = 0.35
+height = 1.2
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_h2yge"]
+albedo_color = Color(0.42, 0.43, 0.47, 1)
+metallic = 0.25
+roughness = 0.5
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_7dm0k"]
+top_radius = 0.9
+bottom_radius = 1.2
+height = 2.5
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_1bvp3"]
+albedo_color = Color(0.58, 0.65, 0.7, 1)
+metallic = 0.2
+roughness = 0.45
+
+[sub_resource type="SphereMesh" id="SphereMesh_7dm0k"]
+radius = 0.45
+height = 0.9
+
+[node name="Main" type="Node3D" unique_id=1944883356]
+
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=2026439287]
+transform = Transform3D(0.9396926, -0.24184474, 0.24184474, 0, 0.70710677, 0.70710677, -0.34202012, -0.664463, 0.664463, 0, 0, 0)
+light_energy = 1.15
+light_indirect_energy = 0.35
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=784209675]
+environment = SubResource("Environment_7dm0k")
+
+[node name="Ground" type="MeshInstance3D" parent="." unique_id=1434228025]
+visible = false
+material_override = SubResource("StandardMaterial3D_0xm2m")
+mesh = SubResource("PlaneMesh_7dm0k")
+
+[node name="GroundBody" type="StaticBody3D" parent="." unique_id=786004108]
+process_mode = 4
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.25, 0)
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="GroundBody" unique_id=84092450]
+shape = SubResource("BoxShape3D_7dm0k")
+
+[node name="Player" type="CharacterBody3D" parent="." unique_id=103748115]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 18, 0)
+script = ExtResource("1_0xm2m")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Player" unique_id=1389111919]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
+shape = SubResource("CapsuleShape3D_7dm0k")
+
+[node name="CameraPivot" type="Node3D" parent="Player" unique_id=987098202]
+transform = Transform3D(1, 0, 0, 0, 0.9781476, 0.2079117, 0, -0.2079117, 0.9781476, 0, 1.6, 0)
+
+[node name="Camera3D" type="Camera3D" parent="Player/CameraPivot" unique_id=1894700068]
+current = true
+
+[node name="Sentinel" type="Node3D" parent="." unique_id=1199439755]
+process_mode = 4
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4, 9, -6)
+visible = false
+script = ExtResource("1_ig7tw")
+player_path = NodePath("../Player")
+
+[node name="Base" type="MeshInstance3D" parent="Sentinel" unique_id=8662927]
+material_override = SubResource("StandardMaterial3D_h2yge")
+mesh = SubResource("CylinderMesh_7dm0k")
+
+[node name="HeadPivot" type="Node3D" parent="Sentinel" unique_id=1765291897]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.2, 0)
+
+[node name="EyeLight" type="SpotLight3D" parent="Sentinel/HeadPivot" unique_id=1977660550]
+transform = Transform3D(1, 0, 0, 0, 0.9961947, 0.08715574, 0, -0.08715574, 0.9961947, 0, 0, -0.25)
+light_energy = 2.7
+spot_range = 24.0
+spot_angle = 23.0
+
+[node name="Head" type="MeshInstance3D" parent="Sentinel/HeadPivot" unique_id=1005590508]
+material_override = SubResource("StandardMaterial3D_1bvp3")
+mesh = SubResource("SphereMesh_7dm0k")
+
+[node name="Landscape" type="Node3D" parent="." unique_id=1829232900]
+script = ExtResource("3_h2yge")
