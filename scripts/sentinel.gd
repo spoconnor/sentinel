@@ -20,33 +20,48 @@ var _action_elapsed: float = 0.0
 var _debug_vision_mesh: MeshInstance3D
 
 func _ready() -> void:
-	_player = get_node_or_null(player_path) as Node3D
-	if _player == null:
-		var root := get_tree().current_scene
-		if root != null:
-			_player = root.get_node_or_null("Player") as Node3D
-	if _player != null:
-		_player_head = _player.get_node_or_null("CameraPivot/Camera3D") as Node3D
+	_refresh_player_refs()
 	_create_debug_vision_mesh()
 
 func _process(delta: float) -> void:
+	if _player == null:
+		_refresh_player_refs()
 	if _player == null or head_pivot == null:
 		return
 
 	var head_pos := head_pivot.global_position
 	var forward := -head_pivot.global_transform.basis.z.normalized()
-	var sees_body := _can_see_point(_player.global_position, head_pos, forward, [_player, self])
+
+	var body_vec := _player.global_position - head_pos
+	var sees_body := false
+	var body_dist := body_vec.length()
+	if body_dist > 0.001 and body_dist <= scan_range:
+		var body_dir := body_vec / body_dist
+		if forward.dot(body_dir) > cone_dot_threshold:
+			sees_body = _has_line_of_sight_to_player(head_pos, _player.global_position)
+
 	var sees_head := false
 	if _player_head != null:
-		sees_head = _can_see_point(_player_head.global_position, head_pos, forward, [_player, self])
+		var head_vec := _player_head.global_position - head_pos
+		var head_dist := head_vec.length()
+		if head_dist > 0.001 and head_dist <= scan_range:
+			var look_dir := head_vec / head_dist
+			if forward.dot(look_dir) > cone_dot_threshold:
+				sees_head = _has_line_of_sight_to_player(head_pos, _player_head.global_position)
+
 	var sees_player := sees_body or sees_head
 
-	var sees_square := false
-	if sees_player:
-		var square_pos := _player.global_position - Vector3(0, 1.65, 0)
-		sees_square = _can_see_point(square_pos, head_pos, forward, [_player, self])
+	var sees_square := sees_player
 
-	if not sees_player:
+	var sees_absorbable := false
+	var absorb_cooldown := false
+	if not sees_player and _player != null:
+		if _player.has_method("watcher_can_absorb"):
+			sees_absorbable = bool(_player.call("watcher_can_absorb", self, forward, head_pos, scan_range, cone_dot_threshold))
+		if _player.has_method("watcher_is_absorb_cooling"):
+			absorb_cooldown = bool(_player.call("watcher_is_absorb_cooling", self))
+
+	if not sees_player and not sees_absorbable and not absorb_cooldown:
 		if timer > 0.0:
 			_turn_elapsed += delta
 			while _turn_elapsed >= timer:
@@ -54,6 +69,8 @@ func _process(delta: float) -> void:
 				_turn_elapsed -= timer
 		elif rotation_speed != 0.0:
 			rotate_y(rotation_speed * delta)
+	else:
+		_turn_elapsed = 0.0
 
 	if sees_player:
 		_locked_time += delta
@@ -65,7 +82,7 @@ func _process(delta: float) -> void:
 	_report_contact(sees_player, sees_square)
 	_try_action(delta, forward, head_pos, sees_player, sees_square)
 
-func _can_see_point(point: Vector3, head_pos: Vector3, forward: Vector3, exclude_nodes: Array) -> bool:
+func _can_see_point(point: Vector3, head_pos: Vector3, forward: Vector3, exclude_nodes: Array, target: Node3D = null) -> bool:
 	var to_point := point - head_pos
 	var distance := to_point.length()
 	if distance > scan_range or distance <= 0.001:
@@ -73,9 +90,9 @@ func _can_see_point(point: Vector3, head_pos: Vector3, forward: Vector3, exclude
 	var dir := to_point / distance
 	if forward.dot(dir) <= cone_dot_threshold:
 		return false
-	return _has_line_of_sight(head_pos, point, exclude_nodes)
+	return _has_line_of_sight(head_pos, point, exclude_nodes, target)
 
-func _has_line_of_sight(from: Vector3, to: Vector3, exclude_nodes: Array) -> bool:
+func _has_line_of_sight(from: Vector3, to: Vector3, exclude_nodes: Array, target: Node3D = null) -> bool:
 	var p := PhysicsRayQueryParameters3D.create(from, to)
 	p.collide_with_areas = false
 	p.collide_with_bodies = true
@@ -84,7 +101,40 @@ func _has_line_of_sight(from: Vector3, to: Vector3, exclude_nodes: Array) -> boo
 		if n is Node3D:
 			p.exclude.append((n as Node3D).get_rid())
 	var hit := get_world_3d().direct_space_state.intersect_ray(p)
-	return hit.is_empty()
+	if hit.is_empty():
+		return target == null
+	if target == null:
+		return false
+	var collider := hit.get("collider") as Node
+	if collider == null:
+		return false
+	return collider == target or target.is_ancestor_of(collider)
+
+func _has_line_of_sight_to_player(from: Vector3, to: Vector3) -> bool:
+	if _player == null:
+		return false
+	var p := PhysicsRayQueryParameters3D.create(from, to)
+	p.collide_with_areas = false
+	p.collide_with_bodies = true
+	p.exclude = []
+	var hit := get_world_3d().direct_space_state.intersect_ray(p)
+	if hit.is_empty():
+		# Unobstructed ray to the point counts as visible player.
+		return true
+	var collider := hit.get("collider") as Node
+	if collider == null:
+		return false
+	return collider == _player or _player.is_ancestor_of(collider)
+
+func _refresh_player_refs() -> void:
+	_player = get_node_or_null(player_path) as Node3D
+	if _player == null:
+		var root := get_tree().current_scene
+		if root != null:
+			_player = root.get_node_or_null("Player") as Node3D
+	_player_head = null
+	if _player != null:
+		_player_head = _player.get_node_or_null("CameraPivot/Camera3D") as Node3D
 
 func _report_contact(sees_player: bool, sees_square: bool) -> void:
 	if _player != null and _player.has_method("watcher_update_contact"):

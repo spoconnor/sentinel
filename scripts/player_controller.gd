@@ -38,6 +38,9 @@ var _energy: int = 0
 var _debug_mode: bool = false
 var _build_root: Node3D
 var _active_robot: StaticBody3D
+var _hidden_robot_parent: Node
+var _hidden_robot_index: int = -1
+var _hidden_robot_transform: Transform3D
 var _lost: bool = false
 
 var _watcher_contacts: Dictionary = {}
@@ -60,6 +63,8 @@ func _process(delta: float) -> void:
 	_update_watcher_pressure(delta)
 
 func _unhandled_input(event: InputEvent) -> void:
+	if _lost:
+		return
 	if event is InputEventMouseMotion and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED:
 		rotate_y(-event.relative.x * mouse_sensitivity)
 		_pitch = clamp(_pitch - event.relative.y * mouse_sensitivity, -1.4, 1.4)
@@ -76,9 +81,6 @@ func _unhandled_input(event: InputEvent) -> void:
 
 	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_D:
 		_set_debug_mode(not _debug_mode)
-		return
-
-	if _lost:
 		return
 
 	if event is InputEventKey and event.pressed and not event.echo:
@@ -538,6 +540,7 @@ func _ensure_start_robot_host() -> void:
 	var existing := _get_base_object_at(square)
 	if existing != null and existing is StaticBody3D and existing.is_in_group(GROUP_TRANSFER_ROBOT):
 		_active_robot = existing as StaticBody3D
+		_hide_robot_for_transfer(_active_robot)
 		return
 	if existing != null:
 		return
@@ -546,6 +549,7 @@ func _ensure_start_robot_host() -> void:
 	var robot := _create_robot_node(center, rotation.y, square, 0, null)
 	_build_root.add_child(robot)
 	_active_robot = robot
+	_hide_robot_for_transfer(_active_robot)
 
 func _get_place_target(hit: Dictionary) -> Dictionary:
 	if hit.is_empty():
@@ -683,9 +687,11 @@ func _try_transfer_to_robot() -> void:
 	if _active_robot != null and target_robot == _active_robot:
 		return
 
+	_restore_robot_from_transfer(_active_robot)
 	var from_pos := global_position
 	global_position = target_robot.global_position + Vector3(0, 1.65, 0)
 	_active_robot = target_robot
+	_hide_robot_for_transfer(_active_robot)
 
 	var to_from := from_pos - global_position
 	to_from.y = 0.0
@@ -693,6 +699,35 @@ func _try_transfer_to_robot() -> void:
 		look_at(global_position + to_from.normalized(), Vector3.UP)
 		_pitch = 0.0
 		camera_pivot.rotation.x = _pitch
+
+func _hide_robot_for_transfer(robot: StaticBody3D) -> void:
+	if robot == null or not is_instance_valid(robot):
+		return
+	if not robot.is_inside_tree():
+		return
+
+	_hidden_robot_parent = robot.get_parent()
+	_hidden_robot_index = robot.get_index()
+	_hidden_robot_transform = robot.global_transform
+	_hidden_robot_parent.remove_child(robot)
+
+func _restore_robot_from_transfer(robot: StaticBody3D) -> void:
+	if robot == null or not is_instance_valid(robot):
+		return
+	if robot.is_inside_tree():
+		return
+
+	var parent := _hidden_robot_parent
+	if parent == null or not is_instance_valid(parent):
+		parent = _build_root
+	if parent == null:
+		return
+
+	parent.add_child(robot)
+	var max_index := parent.get_child_count() - 1
+	if _hidden_robot_index >= 0 and _hidden_robot_index <= max_index:
+		parent.move_child(robot, _hidden_robot_index)
+	robot.global_transform = _hidden_robot_transform
 
 func _find_robot_root(node: Node) -> StaticBody3D:
 	var current := node
@@ -731,13 +766,19 @@ func watcher_attempt_action(
 
 	if watcher_kind != "meanie" and sees_player and not sees_square:
 		_watcher_debug_targets[watcher_id] = "meanie-seek"
-		_try_spawn_meanie_near_player(watcher)
+		_try_spawn_meanie_near_player(watcher, forward, head_pos, scan_range, cone_threshold)
 		_update_debug_ui()
 		return
 
 	var target := _find_absorb_target(watcher, forward, head_pos, scan_range, cone_threshold)
 	if target != null:
+		var has_cooldown := _watcher_absorb_ready_at.has(watcher_id)
 		var ready_at := float(_watcher_absorb_ready_at.get(watcher_id, 0.0))
+		if not has_cooldown:
+			_watcher_absorb_ready_at[watcher_id] = now + WATCH_ABSORB_INTERVAL
+			_watcher_debug_targets[watcher_id] = "cooldown"
+			_update_debug_ui()
+			return
 		if now < ready_at:
 			_watcher_debug_targets[watcher_id] = "cooldown"
 			_update_debug_ui()
@@ -750,6 +791,30 @@ func watcher_attempt_action(
 		return
 
 	_update_debug_ui()
+
+func watcher_can_absorb(watcher: Node3D, forward: Vector3, head_pos: Vector3, scan_range: float, cone_threshold: float) -> bool:
+	if _lost or _build_root == null or watcher == null:
+		return false
+	return _find_absorb_target(watcher, forward, head_pos, scan_range, cone_threshold) != null
+
+func watcher_can_see_player_proxy(watcher: Node3D, head_pos: Vector3, forward: Vector3, scan_range: float, cone_threshold: float) -> bool:
+	if watcher == null or _active_robot == null or not is_instance_valid(_active_robot):
+		return false
+	if not _active_robot.is_inside_tree():
+		return false
+	var player_square := _world_to_square(_player_base_position())
+	var robot_square := _world_to_square(_active_robot.global_position)
+	if player_square != robot_square:
+		return false
+	var target_pos := _watcher_target_aim_point(_active_robot)
+	return _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, _active_robot)
+
+func watcher_is_absorb_cooling(watcher: Node3D) -> bool:
+	if watcher == null:
+		return false
+	var watcher_id := watcher.get_instance_id()
+	var now := Time.get_ticks_msec() * 0.001
+	return now < float(_watcher_absorb_ready_at.get(watcher_id, 0.0))
 
 func _find_absorb_target(watcher: Node3D, forward: Vector3, head_pos: Vector3, scan_range: float, cone_threshold: float) -> Node3D:
 	var best: Node3D
@@ -791,15 +856,28 @@ func _find_absorb_target(watcher: Node3D, forward: Vector3, head_pos: Vector3, s
 		if not stacked_tree_absorbable and energy <= 1:
 			continue
 
+		var support_id := int(candidate.get_meta("support_boulder_id", -1))
+		var support := _find_node_by_instance_id(support_id) if level == 1 else null
+		var has_visibility := false
 		var target_pos := candidate.global_position
+
+		if level == 1 and support != null:
+			if kind == "boulder" or kind == "tree":
+				var can_see_candidate := _watcher_can_see_target_point(head_pos, forward, _watcher_target_aim_point(candidate), scan_range, cone_threshold, watcher, candidate)
+				var can_see_support := _watcher_can_see_target_point(head_pos, forward, _watcher_target_aim_point(support), scan_range, cone_threshold, watcher, support)
+				has_visibility = can_see_candidate or can_see_support
+				target_pos = _watcher_target_aim_point(support) if can_see_support and not can_see_candidate else _watcher_target_aim_point(candidate)
+			else:
+				target_pos = _watcher_target_aim_point(support)
+				has_visibility = _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, support)
+		elif level == 0 and _get_stacked_on_boulder(candidate) == null:
+			target_pos = _watcher_ground_aim_point(candidate)
+			has_visibility = _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, null)
+		else:
+			target_pos = _watcher_target_aim_point(candidate)
+			has_visibility = _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, candidate)
+
 		var distance := target_pos.distance_to(head_pos)
-		var has_visibility := _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, candidate)
-		if not has_visibility and stacked_tree_absorbable:
-			for b in boulder_chain:
-				if _watcher_can_see_target_point(head_pos, forward, b.global_position, scan_range, cone_threshold, watcher, b):
-					has_visibility = true
-					distance = head_pos.distance_to(b.global_position)
-					break
 		if not has_visibility:
 			continue
 
@@ -807,6 +885,23 @@ func _find_absorb_target(watcher: Node3D, forward: Vector3, head_pos: Vector3, s
 			best_dist = distance
 			best = candidate
 	return best
+
+func _watcher_target_aim_point(target: Node3D) -> Vector3:
+	if target == null:
+		return Vector3.ZERO
+	var kind := String(target.get_meta("object_kind", ""))
+	if kind == "tree":
+		return target.global_position + Vector3(0, 0.95, 0)
+	if kind == "robot":
+		return target.global_position + Vector3(0, 0.85, 0)
+	return target.global_position
+
+func _watcher_ground_aim_point(target: Node3D) -> Vector3:
+	if target == null:
+		return Vector3.ZERO
+	var square := Vector2i(int(target.get_meta("grid_x", 0)), int(target.get_meta("grid_z", 0)))
+	var y := _square_ground_y(square)
+	return _square_center_world(square, y)
 
 func _watcher_can_see_target_point(head_pos: Vector3, forward: Vector3, point: Vector3, scan_range: float, cone_threshold: float, watcher: Node3D, target: Node3D) -> bool:
 	var to_target := point - head_pos
@@ -817,6 +912,26 @@ func _watcher_can_see_target_point(head_pos: Vector3, forward: Vector3, point: V
 	if forward.dot(dir) <= cone_threshold:
 		return false
 	return _has_world_line_of_sight(head_pos, point, watcher, target)
+
+func _watcher_can_see_ground_point(head_pos: Vector3, forward: Vector3, point: Vector3, scan_range: float, cone_threshold: float, watcher: Node3D) -> bool:
+	var to_point := point - head_pos
+	var distance := to_point.length()
+	if distance > scan_range or distance <= 0.001:
+		return false
+	var dir := to_point / distance
+	if forward.dot(dir) <= cone_threshold:
+		return false
+	var p := PhysicsRayQueryParameters3D.create(head_pos, point)
+	p.collide_with_areas = false
+	p.collide_with_bodies = true
+	p.exclude = []
+	if watcher != null:
+		p.exclude.append(watcher.get_rid())
+	var hit := get_world_3d().direct_space_state.intersect_ray(p)
+	if hit.is_empty():
+		return false
+	var collider := hit.get("collider") as Node
+	return _is_removal_square_surface(collider)
 
 func _has_world_line_of_sight(from: Vector3, to: Vector3, watcher: Node3D, target: Node3D) -> bool:
 	var p := PhysicsRayQueryParameters3D.create(from, to)
@@ -888,6 +1003,15 @@ func _square_ground_y(square: Vector2i) -> float:
 		return center.y
 	return float((hit["position"] as Vector3).y)
 
+func _square_ground_hit(square: Vector2i) -> Dictionary:
+	var center := _square_center_world(square, 0.0)
+	var from := Vector3(center.x, 128.0, center.z)
+	var to := Vector3(center.x, -64.0, center.z)
+	var p := PhysicsRayQueryParameters3D.create(from, to)
+	p.collide_with_areas = false
+	p.collide_with_bodies = true
+	return get_world_3d().direct_space_state.intersect_ray(p)
+
 func _spawn_random_tree() -> bool:
 	if _build_root == null:
 		return false
@@ -895,14 +1019,20 @@ func _spawn_random_tree() -> bool:
 		var square := Vector2i(randi_range(0, GRID_SIZE - 1), randi_range(0, GRID_SIZE - 1))
 		if _get_base_object_at(square) != null:
 			continue
-		var y := _square_ground_y(square)
+		var hit := _square_ground_hit(square)
+		if hit.is_empty():
+			continue
+		var normal := hit.get("normal", Vector3.UP) as Vector3
+		if normal.dot(Vector3.UP) < place_normal_dot_min:
+			continue
+		var y := float((hit["position"] as Vector3).y)
 		var pos := _square_center_world(square, y)
 		var tree := _create_tree_node(pos, square, 0, null)
 		_build_root.add_child(tree)
 		return true
 	return false
 
-func _try_spawn_meanie_near_player(watcher: Node3D) -> void:
+func _try_spawn_meanie_near_player(watcher: Node3D, forward: Vector3, head_pos: Vector3, scan_range: float, cone_threshold: float) -> void:
 	var watcher_id := watcher.get_instance_id()
 	var now := Time.get_ticks_msec() * 0.001
 	var ready_at := float(_meanie_cooldowns.get(watcher_id, 0.0))
@@ -918,6 +1048,9 @@ func _try_spawn_meanie_near_player(watcher: Node3D) -> void:
 			continue
 		var kind := String(obj.get_meta("object_kind", ""))
 		if kind != "tree":
+			continue
+		var square_pos := _watcher_ground_aim_point(obj)
+		if not _watcher_can_see_ground_point(head_pos, forward, square_pos, scan_range, cone_threshold, watcher):
 			continue
 		var d := obj.global_position.distance_to(player_pos)
 		if d < best_dist and d <= 12.0:
@@ -1015,21 +1148,18 @@ func _update_watcher_pressure(delta: float) -> void:
 		if bool(e.get("sees_square", false)):
 			sees_square = true
 
-	if sees_player:
+	if sees_player and sees_square:
 		_watch_seen_timer += delta
-		if sees_square:
-			if _watch_seen_timer >= WATCH_LOCK_SECONDS:
-				_watch_drain_timer += delta
-				while _watch_drain_timer >= WATCH_DRAIN_INTERVAL and not _lost:
-					if _energy >= 0:
-						_energy -= 1
-						_update_energy_ui()
-						_spawn_random_tree()
-						if _energy <= -1:
-							_set_lost()
-					_watch_drain_timer -= WATCH_DRAIN_INTERVAL
-		else:
-			_watch_drain_timer = 0.0
+		if _watch_seen_timer >= WATCH_LOCK_SECONDS:
+			_watch_drain_timer += delta
+			while _watch_drain_timer >= WATCH_DRAIN_INTERVAL and not _lost:
+				if _energy >= 0:
+					_energy -= 1
+					_update_energy_ui()
+					_spawn_random_tree()
+					if _energy <= -1:
+						_set_lost()
+				_watch_drain_timer -= WATCH_DRAIN_INTERVAL
 	else:
 		_watch_seen_timer = 0.0
 		_watch_drain_timer = 0.0
