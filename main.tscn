@@ -1,6 +1,7 @@
 [gd_scene format=3 uid="uid://bhxt6y2a4p66t"]
 
 [ext_resource type="Script" uid="uid://cscsetbflq68x" path="res://scripts/player_controller.gd" id="1_0xm2m"]
+[ext_resource type="Script" uid="uid://cr73xoffm44nl" path="res://scripts/main_controller.gd" id="1_1bvp3"]
 [ext_resource type="Script" uid="uid://ikxkhijk4oj3" path="res://scripts/sentinel.gd" id="1_ig7tw"]
 [ext_resource type="Script" uid="uid://bwipdxen8tdxa" path="res://scripts/landscape_generator.gd" id="3_h2yge"]
 
@@ -47,6 +48,7 @@ radius = 0.45
 height = 0.9
 
 [node name="Main" type="Node3D" unique_id=1944883356]
+script = ExtResource("1_1bvp3")
 
 [node name="Sun" type="DirectionalLight3D" parent="." unique_id=2026439287]
 transform = Transform3D(0.9396926, -0.24184474, 0.24184474, 0, 0.70710677, 0.70710677, -0.34202012, -0.664463, 0.664463, 0, 0, 0)

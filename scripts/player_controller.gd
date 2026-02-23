@@ -1,4 +1,5 @@
 extends CharacterBody3D
+signal game_won(ending_energy: int)
 
 @export var mouse_sensitivity: float = 0.0025
 @export var gravity: float = 12.0
@@ -25,10 +26,9 @@ const WATCH_ABSORB_INTERVAL := 5.0
 const WATCH_CONTACT_STALE_SECONDS := 0.7
 const GRID_SIZE := 31
 
-@export var starting_energy: int = 100
+@export var starting_energy: int = 5
 
 var _pitch: float = 0.0
-var _crosshair_visible: bool = false
 var _crosshair_layer: CanvasLayer
 var _energy_layer: CanvasLayer
 var _energy_label: Label
@@ -36,12 +36,18 @@ var _warning_label: Label
 var _debug_label: Label
 var _energy: int = 0
 var _debug_mode: bool = false
+var _sentinel_isolate_mode: bool = false
+var _sentinel_hidden_visuals: Array = []
 var _build_root: Node3D
 var _active_robot: StaticBody3D
 var _hidden_robot_parent: Node
 var _hidden_robot_index: int = -1
 var _hidden_robot_transform: Transform3D
 var _lost: bool = false
+var _won: bool = false
+var _round_active: bool = true
+var _sentinel_start_square: Vector2i = Vector2i.ZERO
+var _sentinel_start_square_valid: bool = false
 
 var _watcher_contacts: Dictionary = {}
 var _watcher_debug_targets: Dictionary = {}
@@ -50,6 +56,10 @@ var _watch_seen_timer: float = 0.0
 var _watch_drain_timer: float = 0.0
 var _meanie_cooldowns: Dictionary = {}
 var _watcher_script := load("res://scripts/sentinel.gd")
+const ROBOT_MODEL_PATH := "res://models/robot.glb"
+const TREE_MODEL_PATH := "res://models/tree.glb"
+const BOULDER_MODEL_PATH := "res://models/boulder.glb"
+const MEANIE_MODEL_PATH := "res://models/meanie.glb"
 
 func _ready() -> void:
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
@@ -58,12 +68,19 @@ func _ready() -> void:
 	call_deferred("_create_crosshair")
 	call_deferred("_create_energy_ui")
 	call_deferred("_ensure_start_robot_host")
+	call_deferred("_cache_sentinel_start_square")
 
 func _process(delta: float) -> void:
+	if not _round_active:
+		return
+	if not _sentinel_start_square_valid:
+		_cache_sentinel_start_square()
 	_update_watcher_pressure(delta)
 
 func _unhandled_input(event: InputEvent) -> void:
-	if _lost:
+	if not _round_active:
+		return
+	if _lost or _won:
 		return
 	if event is InputEventMouseMotion and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED:
 		rotate_y(-event.relative.x * mouse_sensitivity)
@@ -82,28 +99,28 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_D:
 		_set_debug_mode(not _debug_mode)
 		return
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_F:
+		_toggle_sentinel_isolate_mode()
+		return
 
 	if event is InputEventKey and event.pressed and not event.echo:
 		match event.keycode:
-			KEY_SPACE:
-				_toggle_crosshair()
 			KEY_T:
-				if _crosshair_visible:
-					_try_place_tree()
+				_try_place_tree()
 			KEY_B:
-				if _crosshair_visible:
-					_try_place_boulder()
+				_try_place_boulder()
 			KEY_R:
-				if _crosshair_visible:
-					_try_place_robot()
+				_try_place_robot()
 			KEY_Q:
-				if _crosshair_visible:
-					_try_transfer_to_robot()
+				_try_transfer_to_robot()
 			KEY_A:
-				if _crosshair_visible:
-					_try_remove_object()
+				_try_remove_object()
+			KEY_H:
+				_try_hyperspace()
 
 func _physics_process(delta: float) -> void:
+	if not _round_active:
+		return
 	if not is_on_floor():
 		velocity.y -= gravity * delta
 	elif velocity.y < 0.0:
@@ -113,15 +130,6 @@ func _physics_process(delta: float) -> void:
 	velocity.z = 0.0
 	move_and_slide()
 	_update_robot_overlap_collisions()
-
-func _toggle_crosshair() -> void:
-	if _crosshair_layer == null:
-		_create_crosshair()
-	_crosshair_visible = not _crosshair_visible
-	if _crosshair_layer != null:
-		_crosshair_layer.visible = _crosshair_visible
-	if _crosshair_visible:
-		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
 func _ensure_build_root() -> void:
 	var root := get_tree().current_scene
@@ -143,7 +151,7 @@ func _create_crosshair() -> void:
 	_crosshair_layer = CanvasLayer.new()
 	_crosshair_layer.name = "Crosshair"
 	_crosshair_layer.layer = 10
-	_crosshair_layer.visible = _crosshair_visible
+	_crosshair_layer.visible = true
 	root.call_deferred("add_child", _crosshair_layer)
 
 	var ui := Control.new()
@@ -230,6 +238,10 @@ func _update_energy_ui() -> void:
 func _update_warning_ui(sees_player: bool, sees_square: bool) -> void:
 	if _warning_label == null:
 		return
+	if _won:
+		_warning_label.text = "YOU WIN"
+		_warning_label.modulate = Color(0.4, 1.0, 0.45)
+		return
 	if _lost:
 		_warning_label.text = "GAME OVER"
 		_warning_label.modulate = Color(1.0, 0.2, 0.2)
@@ -265,6 +277,7 @@ func _update_debug_ui() -> void:
 
 	var lines: Array[String] = []
 	lines.append("DEBUG MODE: ON")
+	lines.append("SENTINEL ISOLATE: %s" % ("ON" if _sentinel_isolate_mode else "OFF"))
 	for watcher_id in _watcher_contacts.keys():
 		var entry: Dictionary = _watcher_contacts[watcher_id]
 		var kind := String(entry.get("kind", "watcher"))
@@ -277,6 +290,63 @@ func _update_debug_ui() -> void:
 	if lines.size() == 1:
 		lines.append("No watcher contact")
 	_debug_label.text = "\n".join(lines)
+
+func _toggle_sentinel_isolate_mode() -> void:
+	_sentinel_isolate_mode = not _sentinel_isolate_mode
+	if _sentinel_isolate_mode:
+		_enable_sentinel_isolate_mode()
+	else:
+		_disable_sentinel_isolate_mode()
+	_update_debug_ui()
+
+func _enable_sentinel_isolate_mode() -> void:
+	_sentinel_hidden_visuals.clear()
+	var root := get_tree().current_scene
+	if root == null:
+		_sentinel_isolate_mode = false
+		return
+	var sentinels := _collect_sentinel_nodes(root)
+	if sentinels.is_empty():
+		_sentinel_isolate_mode = false
+		return
+	_hide_non_sentinel_visuals(root, sentinels)
+
+func _disable_sentinel_isolate_mode() -> void:
+	for entry in _sentinel_hidden_visuals:
+		var visual := entry.get("node") as VisualInstance3D
+		if visual == null or not is_instance_valid(visual):
+			continue
+		visual.visible = bool(entry.get("visible", true))
+	_sentinel_hidden_visuals.clear()
+
+func _collect_sentinel_nodes(node: Node) -> Array[Node3D]:
+	var sentinels: Array[Node3D] = []
+	_collect_sentinel_nodes_recursive(node, sentinels)
+	return sentinels
+
+func _collect_sentinel_nodes_recursive(node: Node, sentinels: Array[Node3D]) -> void:
+	var node3d := node as Node3D
+	if node3d != null and String(node3d.get_meta("object_kind", "")) == "sentinel":
+		sentinels.append(node3d)
+	for child in node.get_children():
+		_collect_sentinel_nodes_recursive(child, sentinels)
+
+func _hide_non_sentinel_visuals(node: Node, sentinels: Array[Node3D]) -> void:
+	var visual := node as VisualInstance3D
+	if visual != null and visual != camera and not _is_part_of_any_sentinel(visual, sentinels):
+		_sentinel_hidden_visuals.append({"node": visual, "visible": visual.visible})
+		visual.visible = false
+	for child in node.get_children():
+		_hide_non_sentinel_visuals(child, sentinels)
+
+func _is_part_of_any_sentinel(node: Node, sentinels: Array[Node3D]) -> bool:
+	var current := node
+	while current != null:
+		for sentinel in sentinels:
+			if current == sentinel:
+				return true
+		current = current.get_parent()
+	return false
 
 func _energy_cost_for_kind(kind: String) -> int:
 	match kind:
@@ -316,10 +386,48 @@ func _gain_energy(amount: int) -> void:
 	_update_energy_ui()
 
 func _set_lost() -> void:
-	if _lost:
+	if _lost or _won:
 		return
 	_lost = true
 	_update_warning_ui(false, false)
+
+func _set_won() -> void:
+	if _won or _lost:
+		return
+	_won = true
+	_update_warning_ui(false, false)
+	game_won.emit(_energy)
+
+func set_round_active(active: bool) -> void:
+	_round_active = active
+	if not active:
+		velocity = Vector3.ZERO
+
+func begin_round() -> void:
+	_lost = false
+	_won = false
+	_round_active = true
+	_energy = max(0, starting_energy)
+	_update_energy_ui()
+	_update_warning_ui(false, false)
+	_watcher_contacts.clear()
+	_watcher_debug_targets.clear()
+	_watcher_absorb_ready_at.clear()
+	_watch_seen_timer = 0.0
+	_watch_drain_timer = 0.0
+	_meanie_cooldowns.clear()
+	_sentinel_start_square_valid = false
+	_sentinel_start_square = Vector2i.ZERO
+	_restore_robot_from_transfer(_active_robot)
+	_active_robot = null
+	_hidden_robot_parent = null
+	_hidden_robot_index = -1
+	_hidden_robot_transform = Transform3D.IDENTITY
+	call_deferred("_ensure_start_robot_host")
+	call_deferred("_cache_sentinel_start_square")
+
+func get_energy_value() -> int:
+	return _energy
 
 func _get_crosshair_hit() -> Dictionary:
 	if camera == null:
@@ -362,6 +470,20 @@ func _world_to_square(pos: Vector3) -> Vector2i:
 func _player_base_position() -> Vector3:
 	return global_position - Vector3(0, 1.65, 0)
 
+func _player_occupied_square() -> Vector2i:
+	if _active_robot != null and is_instance_valid(_active_robot):
+		if _active_robot.has_meta("grid_x") and _active_robot.has_meta("grid_z"):
+			return Vector2i(int(_active_robot.get_meta("grid_x", 0)), int(_active_robot.get_meta("grid_z", 0)))
+		return _world_to_square(_active_robot_proxy_position())
+	return _world_to_square(_player_base_position())
+
+func _node_square(node: Node3D) -> Vector2i:
+	if node != null and node.has_meta("grid_x") and node.has_meta("grid_z"):
+		return Vector2i(int(node.get_meta("grid_x", 0)), int(node.get_meta("grid_z", 0)))
+	if node == null:
+		return Vector2i(0, 0)
+	return _world_to_square(node.global_position)
+
 func _set_robot_collision_enabled(robot: StaticBody3D, enabled: bool) -> void:
 	for child in robot.get_children():
 		var col := child as CollisionShape3D
@@ -393,13 +515,50 @@ func _find_boulder_root(node: Node) -> StaticBody3D:
 		current = current.get_parent()
 	return null
 
-func _find_placeable_root(node: Node) -> Node3D:
+func _find_pedestal_root(node: Node) -> StaticBody3D:
 	var current := node
 	while current != null:
-		if current is Node3D and current.is_in_group(GROUP_BUILD_PLACEABLE):
-			return current as Node3D
+		if current is StaticBody3D and String((current as Node3D).get_meta("object_kind", "")) == "pedestal":
+			return current as StaticBody3D
 		current = current.get_parent()
 	return null
+
+func _find_placeable_root(node: Node) -> StaticBody3D:
+	var current := node
+	while current != null:
+		if current is StaticBody3D and current.is_in_group(GROUP_BUILD_PLACEABLE):
+			return current as StaticBody3D
+		current = current.get_parent()
+	return null
+
+func _is_pedestal_top_hit(pedestal: Node3D, hit: Dictionary) -> bool:
+	if pedestal == null or hit.is_empty():
+		return false
+	var hit_pos := hit.get("position", Vector3.ZERO) as Vector3
+	# Pedestal top is around local y=0.8; accept only hits near that top cap.
+	return (hit_pos.y - pedestal.global_position.y) >= 0.68
+
+func _can_see_pedestal_top_for_square(square: Vector2i) -> bool:
+	if camera == null:
+		return false
+	var target := _square_center_world(square, _square_ground_y(square) + 0.8)
+	var p := PhysicsRayQueryParameters3D.create(camera.global_position, target)
+	p.collide_with_areas = false
+	p.collide_with_bodies = true
+	p.exclude = [self]
+	var hit := get_world_3d().direct_space_state.intersect_ray(p)
+	if hit.is_empty():
+		return false
+	var collider := hit.get("collider") as Node
+	if collider == null:
+		return false
+	var pedestal := _find_pedestal_root(collider)
+	if pedestal != null and _node_square(pedestal) == square:
+		return true
+	var placeable := _find_placeable_root(collider)
+	if placeable != null and String(placeable.get_meta("object_kind", "")) == "sentinel" and _node_square(placeable) == square:
+		return true
+	return false
 
 func _get_base_object_at(square: Vector2i) -> Node3D:
 	if _build_root == null:
@@ -430,12 +589,76 @@ func _get_stacked_on_boulder(boulder: Node3D) -> Node3D:
 			return n
 	return null
 
-func _has_object_on_top(base_obj: Node3D) -> bool:
-	if base_obj == null:
+func _get_top_object_at_square(square: Vector2i) -> Node3D:
+	var base := _get_base_object_at(square)
+	if base == null:
+		return null
+	if String(base.get_meta("object_kind", "")) != "boulder":
+		return base
+
+	var current := base
+	while current != null:
+		var stacked := _get_stacked_on_boulder(current)
+		if stacked == null:
+			return current
+		current = stacked
+		if String(current.get_meta("object_kind", "")) != "boulder":
+			return current
+	return base
+
+func _get_top_boulder_at_square(square: Vector2i) -> Node3D:
+	var base := _get_base_object_at(square)
+	if base == null or String(base.get_meta("object_kind", "")) != "boulder":
+		return null
+
+	var current := base
+	while current != null:
+		var stacked := _get_stacked_on_boulder(current)
+		if stacked == null:
+			return current
+		if String(stacked.get_meta("object_kind", "")) != "boulder":
+			return current
+		current = stacked
+	return base
+
+func _get_robot_at_square(square: Vector2i) -> StaticBody3D:
+	if _build_root == null:
+		return null
+	for c in _build_root.get_children():
+		var robot := c as StaticBody3D
+		if robot == null or not robot.is_in_group(GROUP_TRANSFER_ROBOT):
+			continue
+		if int(robot.get_meta("grid_x", 999999)) == square.x and int(robot.get_meta("grid_z", 999999)) == square.y:
+			return robot
+	return null
+
+func _cache_sentinel_start_square() -> void:
+	if _sentinel_start_square_valid or _build_root == null:
+		return
+
+	if _build_root.has_meta("sentinel_start_square_x") and _build_root.has_meta("sentinel_start_square_z"):
+		_sentinel_start_square = Vector2i(int(_build_root.get_meta("sentinel_start_square_x", 0)), int(_build_root.get_meta("sentinel_start_square_z", 0)))
+		_sentinel_start_square_valid = true
+		return
+
+	for c in _build_root.get_children():
+		var n := c as Node3D
+		if n == null:
+			continue
+		if String(n.get_meta("object_kind", "")) != "sentinel":
+			continue
+		if not n.has_meta("grid_x") or not n.has_meta("grid_z"):
+			continue
+		_sentinel_start_square = Vector2i(int(n.get_meta("grid_x", 0)), int(n.get_meta("grid_z", 0)))
+		_sentinel_start_square_valid = true
+		return
+
+func _is_sentinel_square(square: Vector2i) -> bool:
+	if not _sentinel_start_square_valid:
+		_cache_sentinel_start_square()
+	if not _sentinel_start_square_valid:
 		return false
-	if base_obj.is_in_group(GROUP_BUILD_BOULDER):
-		return _get_stacked_on_boulder(base_obj) != null
-	return false
+	return square == _sentinel_start_square
 
 func _tag_build_object(node: Node3D, kind: String, square: Vector2i, level: int, support_boulder: Node3D) -> void:
 	node.add_to_group(GROUP_BUILD_PLACEABLE)
@@ -445,6 +668,23 @@ func _tag_build_object(node: Node3D, kind: String, square: Vector2i, level: int,
 	node.set_meta("stack_level", level)
 	node.set_meta("support_boulder_id", -1 if support_boulder == null else int(support_boulder.get_instance_id()))
 
+func _attach_model_contents(parent: Node3D, model_path: String) -> void:
+	if parent == null or model_path == "":
+		return
+	var packed := ResourceLoader.load(model_path) as PackedScene
+	if packed == null:
+		return
+	var inst := packed.instantiate() as Node3D
+	if inst == null:
+		return
+	parent.add_child(inst)
+	for child in inst.get_children():
+		inst.remove_child(child)
+		if child is Node:
+			(child as Node).owner = null
+		parent.add_child(child)
+	inst.queue_free()
+
 func _create_tree_node(pos: Vector3, square: Vector2i, level: int, support: Node3D) -> StaticBody3D:
 	var tree := StaticBody3D.new()
 	_tag_build_object(tree, "tree", square, level, support)
@@ -452,27 +692,13 @@ func _create_tree_node(pos: Vector3, square: Vector2i, level: int, support: Node
 
 	var col := CollisionShape3D.new()
 	var shape := CapsuleShape3D.new()
-	shape.radius = 0.2
-	shape.height = 1.4
+	shape.radius = 0.38
+	shape.height = 2.7
 	col.shape = shape
-	col.position.y = 0.95
+	col.position.y = 1.55
 	tree.add_child(col)
 
-	var trunk := MeshInstance3D.new()
-	var trunk_mesh := CylinderMesh.new()
-	trunk_mesh.top_radius = 0.16
-	trunk_mesh.bottom_radius = 0.2
-	trunk_mesh.height = 1.2
-	trunk.mesh = trunk_mesh
-	trunk.position.y = 0.6
-	tree.add_child(trunk)
-
-	var crown := MeshInstance3D.new()
-	var crown_mesh := SphereMesh.new()
-	crown_mesh.radius = 0.65
-	crown.mesh = crown_mesh
-	crown.position.y = 1.55
-	tree.add_child(crown)
+	_attach_model_contents(tree, TREE_MODEL_PATH)
 
 	return tree
 
@@ -484,18 +710,11 @@ func _create_boulder_node(pos: Vector3, square: Vector2i, level: int, support: N
 
 	var shape := CollisionShape3D.new()
 	var box := BoxShape3D.new()
-	box.size = Vector3(1.0, 1.0, 1.0)
+	box.size = Vector3(1.02, 1.0, 1.02)
 	shape.shape = box
 	boulder.add_child(shape)
 
-	var mesh := MeshInstance3D.new()
-	var cube := BoxMesh.new()
-	cube.size = Vector3(1.0, 1.0, 1.0)
-	mesh.mesh = cube
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.34, 0.34, 0.38)
-	mesh.material_override = mat
-	boulder.add_child(mesh)
+	_attach_model_contents(boulder, BOULDER_MODEL_PATH)
 
 	return boulder
 
@@ -514,22 +733,18 @@ func _create_robot_node(pos: Vector3, yaw: float, square: Vector2i, level: int, 
 	body_col.position.y = 0.85
 	robot.add_child(body_col)
 
-	var body_mesh := MeshInstance3D.new()
-	var capsule := CapsuleMesh.new()
-	capsule.radius = 0.32
-	capsule.height = 1.0
-	body_mesh.mesh = capsule
-	body_mesh.position.y = 0.85
-	var body_mat := StandardMaterial3D.new()
-	body_mat.albedo_color = Color(0.3, 0.9, 0.95)
-	body_mesh.material_override = body_mat
-	robot.add_child(body_mesh)
+	_attach_model_contents(robot, ROBOT_MODEL_PATH)
 
 	return robot
 
 func _ensure_start_robot_host() -> void:
 	if _build_root == null:
 		_ensure_build_root()
+		call_deferred("_ensure_start_robot_host")
+		return
+
+	# Wait until generated objects exist before creating fallback robot host.
+	if _build_root.get_child_count() == 0:
 		call_deferred("_ensure_start_robot_host")
 		return
 
@@ -560,17 +775,39 @@ func _get_place_target(hit: Dictionary) -> Dictionary:
 	var boulder := _find_boulder_root(collider)
 	if boulder != null:
 		var b_square := _world_to_square(boulder.global_position)
+		var top_boulder := _get_top_boulder_at_square(b_square)
+		if top_boulder == null:
+			return {}
 		return {
 			"square": b_square,
-			"pos": boulder.global_position + Vector3(0, 0.5, 0),
+			"pos": top_boulder.global_position + Vector3(0, 0.5, 0),
 			"level": 1,
-			"support": boulder,
+			"support": top_boulder,
+		}
+
+	var pedestal := _find_pedestal_root(collider)
+	if pedestal != null and _is_pedestal_top_hit(pedestal, hit):
+		var p_square := _node_square(pedestal)
+		return {
+			"square": p_square,
+			"pos": pedestal.global_position + Vector3(0, 0.8, 0),
+			"level": 0,
+			"support": null,
 		}
 
 	if not _is_horizontal_surface(hit):
 		return {}
 
 	var square := _world_to_square(hit["position"])
+	var top_boulder_on_square := _get_top_boulder_at_square(square)
+	if top_boulder_on_square != null:
+		return {
+			"square": square,
+			"pos": top_boulder_on_square.global_position + Vector3(0, 0.5, 0),
+			"level": 1,
+			"support": top_boulder_on_square,
+		}
+
 	var pos := _square_center_world(square, (hit["position"] as Vector3).y)
 	return {
 		"square": square,
@@ -583,6 +820,8 @@ func _can_place(target: Dictionary) -> bool:
 	if target.is_empty():
 		return false
 	var square: Vector2i = target["square"]
+	if square == _player_occupied_square():
+		return false
 	var level := int(target["level"])
 	var support := target["support"] as Node3D
 	var base := _get_base_object_at(square)
@@ -643,26 +882,56 @@ func _try_remove_object() -> void:
 	if collider == null:
 		return
 
-	if _is_horizontal_surface(hit) and _is_removal_square_surface(collider):
-		var sq_hit := _world_to_square(hit["position"])
-		var base := _get_base_object_at(sq_hit)
-		if base != null and (_active_robot == null or base != _active_robot) and not _has_object_on_top(base):
-			_gain_energy(_energy_cost_for_node(base))
-			base.queue_free()
-			return
+	var target_square := Vector2i(999999, 999999)
+	var focused_placeable := _find_placeable_root(collider)
+	var focused_kind := ""
+	if focused_placeable != null:
+		focused_kind = String(focused_placeable.get_meta("object_kind", ""))
+	var blocked_direct_kind := focused_kind == "tree" or focused_kind == "robot" or focused_kind == "meanie"
+	# Primary path: targeting terrain/ground resolves to that square, even on slopes.
+	if _is_removal_square_surface(collider):
+		target_square = _world_to_square(hit["position"])
 
-	var boulder := _find_boulder_root(collider)
-	if boulder != null:
-		var stacked := _get_stacked_on_boulder(boulder)
-		if stacked != null:
-			if _has_object_on_top(stacked):
-				return
-			_gain_energy(_energy_cost_for_node(stacked))
-			stacked.queue_free()
-			return
-		_gain_energy(_energy_cost_for_node(boulder))
-		boulder.queue_free()
+	# Secondary path: horizontal top-surface targeting.
+	if target_square.x == 999999 and _is_horizontal_surface(hit):
+		if blocked_direct_kind and focused_placeable != null:
+			# Treat this as targeting the square the object stands on.
+			target_square = _node_square(focused_placeable)
+		else:
+			target_square = _world_to_square(hit["position"])
+
+	if target_square.x == 999999:
+		var boulder := _find_boulder_root(collider)
+		if boulder != null:
+			target_square = _node_square(boulder)
+		else:
+			var pedestal := _find_pedestal_root(collider)
+			if pedestal != null and _is_pedestal_top_hit(pedestal, hit):
+				target_square = _node_square(pedestal)
+			else:
+				var placeable := _find_placeable_root(collider)
+				if placeable != null:
+					var kind := String(placeable.get_meta("object_kind", ""))
+					var placeable_square := _node_square(placeable)
+					if kind == "sentinel":
+						if _can_see_pedestal_top_for_square(placeable_square):
+							target_square = placeable_square
+					elif kind == "boulder":
+						target_square = placeable_square
+
+	if target_square.x == 999999:
 		return
+	if target_square == _player_occupied_square():
+		return
+
+	var top := _get_top_object_at_square(target_square)
+	if top == null:
+		return
+	if _active_robot != null and top == _active_robot:
+		return
+
+	_gain_energy(_energy_cost_for_node(top))
+	top.queue_free()
 
 func _is_removal_square_surface(collider: Node) -> bool:
 	if collider == null:
@@ -682,8 +951,61 @@ func _try_transfer_to_robot() -> void:
 	var collider := hit.get("collider") as Node
 	if collider == null:
 		return
+
 	var target_robot := _find_robot_root(collider)
 	if target_robot == null:
+		var target_square := Vector2i(999999, 999999)
+		var boulder := _find_boulder_root(collider)
+		if boulder != null:
+			target_square = _node_square(boulder)
+		elif _is_horizontal_surface(hit):
+			target_square = _world_to_square(hit["position"])
+
+		if target_square.x != 999999:
+			target_robot = _get_robot_at_square(target_square)
+
+	if target_robot == null:
+		return
+	_perform_transfer_to_robot(target_robot)
+
+func _try_hyperspace() -> void:
+	if _build_root == null:
+		_ensure_build_root()
+	var current_square := _player_occupied_square()
+	if _is_sentinel_square(current_square):
+		_set_won()
+		return
+	if _energy < ENERGY_ROBOT:
+		return
+
+	var max_y := _square_ground_y(current_square)
+	for _i in range(256):
+		var square := Vector2i(randi_range(0, GRID_SIZE - 1), randi_range(0, GRID_SIZE - 1))
+		if square == current_square:
+			continue
+		if _get_base_object_at(square) != null:
+			continue
+
+		var hit := _square_ground_hit(square)
+		if hit.is_empty():
+			continue
+		var normal := hit.get("normal", Vector3.UP) as Vector3
+		if normal.dot(Vector3.UP) < place_normal_dot_min:
+			continue
+		var y := float((hit["position"] as Vector3).y)
+		if y > max_y + 0.001:
+			continue
+
+		if not _try_spend_energy(ENERGY_ROBOT):
+			return
+		var pos := _square_center_world(square, y)
+		var robot := _create_robot_node(pos, rotation.y, square, 0, null)
+		_build_root.add_child(robot)
+		_perform_transfer_to_robot(robot)
+		return
+
+func _perform_transfer_to_robot(target_robot: StaticBody3D) -> void:
+	if target_robot == null or not is_instance_valid(target_robot):
 		return
 	if _active_robot != null and target_robot == _active_robot:
 		return
@@ -872,6 +1194,10 @@ func _find_absorb_target(watcher: Node3D, forward: Vector3, head_pos: Vector3, s
 				var stacked_kind := String(candidate.get_meta("object_kind", ""))
 				if stacked_kind == "boulder":
 					boulder_chain.append(candidate)
+
+		var candidate_square := _node_square(candidate)
+		if candidate_square == _player_occupied_square():
+			continue
 
 		var kind := String(candidate.get_meta("object_kind", ""))
 		var level := int(candidate.get_meta("stack_level", 0))
@@ -1145,58 +1471,12 @@ func _convert_tree_to_meanie(tree: Node3D) -> void:
 	tree.set("scan_range", 24.0)
 	tree.set("cone_dot_threshold", 0.84)
 
-	var base := MeshInstance3D.new()
-	base.name = "Base"
-	var base_mesh := CylinderMesh.new()
-	base_mesh.top_radius = 0.24
-	base_mesh.bottom_radius = 0.3
-	base_mesh.height = 0.9
-	base.mesh = base_mesh
-	base.position.y = 0.45
-	var base_mat := StandardMaterial3D.new()
-	base_mat.albedo_color = Color(0.9, 0.25, 0.7)
-	base.material_override = base_mat
-	tree.add_child(base)
-
-	var head_pivot := Node3D.new()
-	head_pivot.name = "HeadPivot"
-	head_pivot.position.y = 1.0
-	tree.add_child(head_pivot)
-
-	var head := MeshInstance3D.new()
-	head.name = "Head"
-	var head_mesh := SphereMesh.new()
-	head_mesh.radius = 0.23
-	head.mesh = head_mesh
-	var head_mat := StandardMaterial3D.new()
-	head_mat.albedo_color = Color(1.0, 0.45, 0.85)
-	head.material_override = head_mat
-	head_pivot.add_child(head)
-
-	var face := MeshInstance3D.new()
-	face.name = "FaceCone"
-	var cone := CylinderMesh.new()
-	cone.top_radius = 0.01
-	cone.bottom_radius = 0.1
-	cone.height = 0.28
-	face.mesh = cone
-	face.position = Vector3(0, 0, -0.28)
-	face.rotation_degrees = Vector3(90, 0, 0)
-	var face_mat := StandardMaterial3D.new()
-	face_mat.albedo_color = Color(0.1, 0.1, 0.15)
-	face.material_override = face_mat
-	head_pivot.add_child(face)
-
-	var eye := SpotLight3D.new()
-	eye.name = "EyeLight"
-	eye.position = Vector3(0, 0, -0.14)
-	eye.rotation_degrees = Vector3(-6, 0, 0)
-	eye.spot_angle = 22.0
-	eye.spot_range = 20.0
-	eye.light_energy = 3.8
-	head_pivot.add_child(eye)
+	_attach_model_contents(tree, MEANIE_MODEL_PATH)
 
 func _update_watcher_pressure(delta: float) -> void:
+	if _won:
+		_update_warning_ui(false, false)
+		return
 	var now := Time.get_ticks_msec() * 0.001
 	for k in _watcher_contacts.keys():
 		var e: Dictionary = _watcher_contacts[k]

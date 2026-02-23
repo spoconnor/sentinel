@@ -4,17 +4,30 @@ enum ObjType { ROBOT, SENTRY, TREE, BOULDER, MEANIE, SENTINEL, PEDESTAL }
 const GROUP_BUILD_PLACEABLE := "build_placeable"
 const GROUP_TRANSFER_ROBOT := "transfer_robot"
 
-@export var seed_bcd: int = 0x0000
-@export var use_generated_bcd: bool = false
-@export var landscape_bcd: int = 0x0000
+@export var seed_bcd: int = 0x0003
+@export var use_generated_bcd: bool = true
+@export var landscape_bcd: int = 0x0003
 @export var tile_size: float = 1.6
 @export var height_scale: float = 0.8
 
 var _ull: int = 0
 var _terrain_offset := Vector3.ZERO
 var _sentinel_script := load("res://scripts/sentinel.gd")
+const ROBOT_MODEL_PATH := "res://models/robot.glb"
+const TREE_MODEL_PATH := "res://models/tree.glb"
+const BOULDER_MODEL_PATH := "res://models/boulder.glb"
+const PEDESTAL_MODEL_PATH := "res://models/pedestal.glb"
+const SENTRY_MODEL_PATH := "res://models/sentry.glb"
+const SENTINEL_MODEL_PATH := "res://models/sentinel.glb"
 
 func _ready() -> void:
+	_generate_level_objects()
+
+func regenerate_level(new_level: int) -> void:
+	landscape_bcd = new_level & 0xFFFF
+	_generate_level_objects()
+
+func _generate_level_objects() -> void:
 	var bcd := landscape_bcd
 	if use_generated_bcd:
 		bcd = _generate_landscape_bcd_from_sentcode(seed_bcd)
@@ -38,8 +51,18 @@ func _ready() -> void:
 	print("Generated landscape_bcd=0x%04X, objects=%d" % [bcd, objects.size()])
 
 func _spawn_generated_objects(objects: Array) -> void:
+	_cache_sentinel_start_square(objects)
 	_spawn_objects(objects)
 	_apply_player_spawn(objects)
+
+func _cache_sentinel_start_square(objects: Array) -> void:
+	var build_root := _ensure_build_root()
+	for o in objects:
+		if int(o.get("type", -1)) != ObjType.SENTINEL:
+			continue
+		build_root.set_meta("sentinel_start_square_x", int(o.get("x", 0)))
+		build_root.set_meta("sentinel_start_square_z", int(o.get("z", 0)))
+		return
 
 func _seed(land_bcd: int) -> void:
 	_ull = (1 << 16) | (land_bcd & 0xFFFF)
@@ -507,6 +530,9 @@ func _spawn_objects(objects: Array) -> void:
 	add_child(root)
 
 	var build_root := _ensure_build_root()
+	for child in build_root.get_children():
+		build_root.remove_child(child)
+		child.queue_free()
 
 	for o in objects:
 		var type_id := int(o["type"])
@@ -515,20 +541,7 @@ func _spawn_objects(objects: Array) -> void:
 		n.rotation_degrees.y = float(int(o["rot"])) * 360.0 / 256.0
 
 		if type_id == ObjType.TREE:
-			var trunk := MeshInstance3D.new()
-			var trunk_mesh := CylinderMesh.new()
-			trunk_mesh.top_radius = 0.15
-			trunk_mesh.bottom_radius = 0.2
-			trunk_mesh.height = 1.2
-			trunk.mesh = trunk_mesh
-			trunk.position.y = 0.6
-			n.add_child(trunk)
-			var crown := MeshInstance3D.new()
-			var crown_mesh := SphereMesh.new()
-			crown_mesh.radius = 0.6
-			crown.mesh = crown_mesh
-			crown.position.y = 1.6
-			n.add_child(crown)
+			_attach_model_contents(n, TREE_MODEL_PATH)
 			build_root.add_child(n)
 			continue
 
@@ -543,12 +556,10 @@ func _spawn_objects(objects: Array) -> void:
 		mesh_inst.material_override = mat
 
 		if type_id == ObjType.ROBOT:
-			var robot_mesh := CapsuleMesh.new()
-			robot_mesh.radius = 0.35
-			robot_mesh.height = 0.9
-			mesh_inst.mesh = robot_mesh
-			mesh_inst.position.y = 0.9
-			mat.albedo_color = Color(0.3, 0.9, 0.95)
+			_attach_model_contents(n, ROBOT_MODEL_PATH)
+			mesh_inst.queue_free()
+			build_root.add_child(n)
+			continue
 		elif type_id == ObjType.SENTINEL:
 			var sentinel_mesh := SphereMesh.new()
 			sentinel_mesh.radius = 0.6
@@ -556,13 +567,10 @@ func _spawn_objects(objects: Array) -> void:
 			mesh_inst.position.y = 0.8
 			mat.albedo_color = Color(1.0, 0.35, 0.2)
 		elif type_id == ObjType.PEDESTAL:
-			var pedestal_mesh := CylinderMesh.new()
-			pedestal_mesh.top_radius = 0.7
-			pedestal_mesh.bottom_radius = 0.8
-			pedestal_mesh.height = 0.8
-			mesh_inst.mesh = pedestal_mesh
-			mesh_inst.position.y = 0.4
-			mat.albedo_color = Color(0.6, 0.6, 0.65)
+			_attach_model_contents(n, PEDESTAL_MODEL_PATH)
+			mesh_inst.queue_free()
+			root.add_child(n)
+			continue
 		else:
 			var sentry_mesh := CylinderMesh.new()
 			sentry_mesh.top_radius = 0.35
@@ -590,17 +598,35 @@ func _ensure_build_root() -> Node3D:
 	scene_root.add_child(created)
 	return created
 
+func _attach_model_contents(parent: Node3D, model_path: String) -> void:
+	if parent == null or model_path == "":
+		return
+	var packed := ResourceLoader.load(model_path) as PackedScene
+	if packed == null:
+		return
+	var inst := packed.instantiate() as Node3D
+	if inst == null:
+		return
+	parent.add_child(inst)
+	for child in inst.get_children():
+		inst.remove_child(child)
+		if child is Node:
+			(child as Node).owner = null
+		parent.add_child(child)
+	inst.queue_free()
+
 func _create_object_node(type_id: int, data: Dictionary) -> Node3D:
-	var is_build_object := type_id == ObjType.ROBOT or type_id == ObjType.TREE or type_id == ObjType.SENTRY or type_id == ObjType.SENTINEL
+	var is_build_object := type_id == ObjType.ROBOT or type_id == ObjType.TREE or type_id == ObjType.SENTRY or type_id == ObjType.SENTINEL or type_id == ObjType.PEDESTAL
 	var node: Node3D = StaticBody3D.new() if is_build_object else Node3D.new()
 	if not is_build_object:
 		return node
 
-	node.add_to_group(GROUP_BUILD_PLACEABLE)
 	node.set_meta("grid_x", int(data["x"]))
 	node.set_meta("grid_z", int(data["z"]))
-	node.set_meta("stack_level", 0)
-	node.set_meta("support_boulder_id", -1)
+	if type_id != ObjType.PEDESTAL:
+		node.add_to_group(GROUP_BUILD_PLACEABLE)
+		node.set_meta("stack_level", 0)
+		node.set_meta("support_boulder_id", -1)
 
 	match type_id:
 		ObjType.ROBOT:
@@ -617,28 +643,43 @@ func _create_object_node(type_id: int, data: Dictionary) -> Node3D:
 			node.set_meta("object_kind", "tree")
 			var col := CollisionShape3D.new()
 			var shape := CapsuleShape3D.new()
-			shape.radius = 0.2
-			shape.height = 1.4
+			shape.radius = 0.38
+			shape.height = 2.7
 			col.shape = shape
-			col.position.y = 0.95
+			col.position.y = 1.55
 			node.add_child(col)
 		ObjType.SENTINEL:
 			node.set_meta("object_kind", "sentinel")
 			var col := CollisionShape3D.new()
 			var shape := CylinderShape3D.new()
-			shape.radius = 0.7
-			shape.height = 1.4
+			shape.radius = 0.78
+			shape.height = 3.1
 			col.shape = shape
-			col.position.y = 0.7
+			col.position.y = 1.55
 			node.add_child(col)
 		ObjType.SENTRY:
 			node.set_meta("object_kind", "sentry")
 			var col := CollisionShape3D.new()
 			var shape := CylinderShape3D.new()
-			shape.radius = 0.4
-			shape.height = 1.0
+			shape.radius = 0.52
+			shape.height = 2.35
 			col.shape = shape
-			col.position.y = 0.5
+			col.position.y = 1.18
+			node.add_child(col)
+		ObjType.PEDESTAL:
+			node.set_meta("object_kind", "pedestal")
+			var col := CollisionShape3D.new()
+			var shape := ConvexPolygonShape3D.new()
+			var points := PackedVector3Array()
+			var r := 0.78
+			var h0 := 0.0
+			var h1 := 0.8
+			for i in range(6):
+				var a := TAU * float(i) / 6.0
+				points.append(Vector3(cos(a) * r, h0, sin(a) * r))
+				points.append(Vector3(cos(a) * r, h1, sin(a) * r))
+			shape.points = points
+			col.shape = shape
 			node.add_child(col)
 
 	return node
@@ -655,61 +696,7 @@ func _spawn_watcher(root: Node3D, is_sentinel: bool, data: Dictionary) -> void:
 	root.set_process(true)
 	root.set("scan_range", 32.0 if is_sentinel else 26.0)
 
-	var base := MeshInstance3D.new()
-	base.name = "Base"
-	var base_mesh := CylinderMesh.new()
-	if is_sentinel:
-		base_mesh.top_radius = 0.55
-		base_mesh.bottom_radius = 0.7
-		base_mesh.height = 1.4
-	else:
-		base_mesh.top_radius = 0.3
-		base_mesh.bottom_radius = 0.4
-		base_mesh.height = 1.0
-	base.mesh = base_mesh
-	base.position.y = base_mesh.height * 0.5
-	var base_mat := StandardMaterial3D.new()
-	base_mat.albedo_color = Color(0.62, 0.62, 0.68) if is_sentinel else Color(0.85, 0.72, 0.3)
-	base.material_override = base_mat
-	root.add_child(base)
-
-	var head_pivot := Node3D.new()
-	head_pivot.name = "HeadPivot"
-	head_pivot.position.y = 1.45 if is_sentinel else 1.0
-	root.add_child(head_pivot)
-
-	var head := MeshInstance3D.new()
-	head.name = "Head"
-	var head_mesh := SphereMesh.new()
-	head_mesh.radius = 0.42 if is_sentinel else 0.28
-	head.mesh = head_mesh
-	var head_mat := StandardMaterial3D.new()
-	head_mat.albedo_color = Color(0.92, 0.38, 0.22) if is_sentinel else Color(0.96, 0.82, 0.35)
-	head.material_override = head_mat
-	head_pivot.add_child(head)
-
-	var face := MeshInstance3D.new()
-	face.name = "FaceCone"
-	var cone := CylinderMesh.new()
-	cone.top_radius = 0.01
-	cone.bottom_radius = 0.16 if is_sentinel else 0.12
-	cone.height = 0.45 if is_sentinel else 0.35
-	face.mesh = cone
-	face.position = Vector3(0, 0, -0.46 if is_sentinel else -0.34)
-	face.rotation_degrees = Vector3(90, 0, 0)
-	var face_mat := StandardMaterial3D.new()
-	face_mat.albedo_color = Color(0.08, 0.08, 0.1)
-	face.material_override = face_mat
-	head_pivot.add_child(face)
-
-	var eye := SpotLight3D.new()
-	eye.name = "EyeLight"
-	eye.position = Vector3(0, 0, -0.24)
-	eye.rotation_degrees = Vector3(-6, 0, 0)
-	eye.spot_angle = 22.0
-	eye.spot_range = 24.0
-	eye.light_energy = 2.7
-	head_pivot.add_child(eye)
+	_attach_model_contents(root, SENTINEL_MODEL_PATH if is_sentinel else SENTRY_MODEL_PATH)
 
 func _apply_player_spawn(objects: Array) -> void:
 	var player_obj: Dictionary = {}
