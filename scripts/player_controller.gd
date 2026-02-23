@@ -271,7 +271,8 @@ func _update_debug_ui() -> void:
 		var sees_player := bool(entry.get("sees_player", false))
 		var sees_square := bool(entry.get("sees_square", false))
 		var target_kind := String(_watcher_debug_targets.get(watcher_id, "none"))
-		lines.append("%s#%s P:%s S:%s T:%s" % [kind, str(watcher_id), "Y" if sees_player else "N", "Y" if sees_square else "N", target_kind])
+		var los_debug := String(entry.get("los", ""))
+		lines.append("%s#%s P:%s S:%s T:%s %s" % [kind, str(watcher_id), "Y" if sees_player else "N", "Y" if sees_square else "N", target_kind, los_debug])
 
 	if lines.size() == 1:
 		lines.append("No watcher contact")
@@ -737,13 +738,31 @@ func _find_robot_root(node: Node) -> StaticBody3D:
 		current = current.get_parent()
 	return null
 
-func watcher_update_contact(watcher_id: int, sees_player: bool, sees_square: bool, watcher_kind: String = "watcher") -> void:
+func _active_robot_proxy_position() -> Vector3:
+	if _active_robot == null or not is_instance_valid(_active_robot):
+		return _player_base_position()
+	if _active_robot.is_inside_tree():
+		return _active_robot.global_position
+	return _hidden_robot_transform.origin
+
+func _active_robot_support_boulder() -> Node3D:
+	if _active_robot == null or not is_instance_valid(_active_robot):
+		return null
+	var support_id := int(_active_robot.get_meta("support_boulder_id", -1))
+	return _find_node_by_instance_id(support_id)
+
+func _watcher_ground_point_for_square(square: Vector2i) -> Vector3:
+	var y := _square_ground_y(square)
+	return _square_center_world(square, y)
+
+func watcher_update_contact(watcher_id: int, sees_player: bool, sees_square: bool, watcher_kind: String = "watcher", los_debug: String = "") -> void:
 	var now := Time.get_ticks_msec() * 0.001
 	_watcher_contacts[watcher_id] = {
 		"time": now,
 		"sees_player": sees_player,
 		"sees_square": sees_square,
 		"kind": watcher_kind,
+		"los": los_debug,
 	}
 	_update_debug_ui()
 
@@ -798,16 +817,27 @@ func watcher_can_absorb(watcher: Node3D, forward: Vector3, head_pos: Vector3, sc
 	return _find_absorb_target(watcher, forward, head_pos, scan_range, cone_threshold) != null
 
 func watcher_can_see_player_proxy(watcher: Node3D, head_pos: Vector3, forward: Vector3, scan_range: float, cone_threshold: float) -> bool:
-	if watcher == null or _active_robot == null or not is_instance_valid(_active_robot):
+	if watcher == null:
 		return false
-	if not _active_robot.is_inside_tree():
+	if _active_robot == null or not is_instance_valid(_active_robot):
 		return false
-	var player_square := _world_to_square(_player_base_position())
-	var robot_square := _world_to_square(_active_robot.global_position)
-	if player_square != robot_square:
+
+	var robot_pos := _active_robot_proxy_position()
+	var target_pos := robot_pos + Vector3(0, 0.85, 0)
+	return _watcher_can_see_unobstructed_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher)
+func watcher_can_see_player_proxy_ground(watcher: Node3D, head_pos: Vector3, forward: Vector3, scan_range: float, cone_threshold: float) -> bool:
+	if watcher == null:
 		return false
-	var target_pos := _watcher_target_aim_point(_active_robot)
-	return _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, _active_robot)
+	if _active_robot == null or not is_instance_valid(_active_robot):
+		return false
+
+	var support := _active_robot_support_boulder()
+	if support != null and is_instance_valid(support):
+		return _watcher_can_see_target_point(head_pos, forward, _watcher_target_aim_point(support), scan_range, cone_threshold, watcher, support)
+
+	var square := _world_to_square(_active_robot_proxy_position())
+	var ground_point := _watcher_ground_point_for_square(square)
+	return _watcher_can_see_ground_point(head_pos, forward, ground_point, scan_range, cone_threshold, watcher)
 
 func watcher_is_absorb_cooling(watcher: Node3D) -> bool:
 	if watcher == null:
@@ -871,8 +901,9 @@ func _find_absorb_target(watcher: Node3D, forward: Vector3, head_pos: Vector3, s
 				target_pos = _watcher_target_aim_point(support)
 				has_visibility = _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, support)
 		elif level == 0 and _get_stacked_on_boulder(candidate) == null:
-			target_pos = _watcher_ground_aim_point(candidate)
-			has_visibility = _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, null)
+			# Ground-level robot/boulder with no object on top is a valid absorb target.
+			target_pos = _watcher_target_aim_point(candidate)
+			has_visibility = _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, candidate)
 		else:
 			target_pos = _watcher_target_aim_point(candidate)
 			has_visibility = _watcher_can_see_target_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher, candidate)
@@ -903,50 +934,84 @@ func _watcher_ground_aim_point(target: Node3D) -> Vector3:
 	var y := _square_ground_y(square)
 	return _square_center_world(square, y)
 
-func _watcher_can_see_target_point(head_pos: Vector3, forward: Vector3, point: Vector3, scan_range: float, cone_threshold: float, watcher: Node3D, target: Node3D) -> bool:
-	var to_target := point - head_pos
-	var distance := to_target.length()
-	if distance > scan_range or distance <= 0.001:
+func _is_within_horizontal_view(origin: Vector3, forward: Vector3, point: Vector3, max_distance: float, horizontal_dot_threshold: float) -> bool:
+	var to_point := point - origin
+	var flat_to := Vector3(to_point.x, 0.0, to_point.z)
+	var flat_distance := flat_to.length()
+	if flat_distance > max_distance or flat_distance <= 0.001:
 		return false
-	var dir := to_target / distance
-	if forward.dot(dir) <= cone_threshold:
+
+	var flat_forward := Vector3(forward.x, 0.0, forward.z)
+	var flat_forward_len := flat_forward.length()
+	if flat_forward_len <= 0.001:
+		return false
+
+	var forward_dir := flat_forward / flat_forward_len
+	var target_dir := flat_to / flat_distance
+	return forward_dir.dot(target_dir) > horizontal_dot_threshold
+
+func _watcher_can_see_target_point(head_pos: Vector3, forward: Vector3, point: Vector3, scan_range: float, cone_threshold: float, watcher: Node3D, target: Node3D) -> bool:
+	if not _is_within_horizontal_view(head_pos, forward, point, scan_range, cone_threshold):
 		return false
 	return _has_world_line_of_sight(head_pos, point, watcher, target)
 
 func _watcher_can_see_ground_point(head_pos: Vector3, forward: Vector3, point: Vector3, scan_range: float, cone_threshold: float, watcher: Node3D) -> bool:
-	var to_point := point - head_pos
-	var distance := to_point.length()
-	if distance > scan_range or distance <= 0.001:
-		return false
-	var dir := to_point / distance
-	if forward.dot(dir) <= cone_threshold:
+	if not _is_within_horizontal_view(head_pos, forward, point, scan_range, cone_threshold):
 		return false
 	var p := PhysicsRayQueryParameters3D.create(head_pos, point)
 	p.collide_with_areas = false
 	p.collide_with_bodies = true
 	p.exclude = []
-	if watcher != null:
-		p.exclude.append(watcher.get_rid())
+	if watcher is CollisionObject3D:
+		p.exclude.append((watcher as CollisionObject3D).get_rid())
 	var hit := get_world_3d().direct_space_state.intersect_ray(p)
 	if hit.is_empty():
 		return false
 	var collider := hit.get("collider") as Node
 	return _is_removal_square_surface(collider)
 
-func _has_world_line_of_sight(from: Vector3, to: Vector3, watcher: Node3D, target: Node3D) -> bool:
-	var p := PhysicsRayQueryParameters3D.create(from, to)
+func _watcher_can_see_unobstructed_point(head_pos: Vector3, forward: Vector3, point: Vector3, scan_range: float, cone_threshold: float, watcher: Node3D) -> bool:
+	if not _is_within_horizontal_view(head_pos, forward, point, scan_range, cone_threshold):
+		return false
+	var p := PhysicsRayQueryParameters3D.create(head_pos, point)
 	p.collide_with_areas = false
 	p.collide_with_bodies = true
 	p.exclude = []
-	if watcher != null:
-		p.exclude.append(watcher.get_rid())
+	if watcher is CollisionObject3D:
+		p.exclude.append((watcher as CollisionObject3D).get_rid())
 	var hit := get_world_3d().direct_space_state.intersect_ray(p)
-	if hit.is_empty():
-		return false
-	var collider := hit.get("collider") as Node
-	if collider == null or target == null:
-		return false
-	return target.is_ancestor_of(collider) or collider == target
+	return hit.is_empty()
+func _has_world_line_of_sight(from: Vector3, to: Vector3, watcher: Node3D, target: Node3D) -> bool:
+	var ray_start := from
+	var ray_dir := (to - from).normalized()
+	var exclude_rids: Array = []
+	if watcher is CollisionObject3D:
+		exclude_rids.append((watcher as CollisionObject3D).get_rid())
+
+	for _attempt in range(2):
+		var p := PhysicsRayQueryParameters3D.create(ray_start, to)
+		p.collide_with_areas = false
+		p.collide_with_bodies = true
+		p.exclude = exclude_rids
+		var hit := get_world_3d().direct_space_state.intersect_ray(p)
+		if hit.is_empty():
+			return target == null
+		var collider := hit.get("collider") as Node
+		if collider == null:
+			return false
+
+		# Ignore watcher self-hit once, then test the next surface.
+		if watcher != null and (collider == watcher or watcher.is_ancestor_of(collider)):
+			if collider.has_method("get_rid"):
+				exclude_rids.append(collider.call("get_rid"))
+			ray_start = (hit.get("position", ray_start) as Vector3) + ray_dir * 0.05
+			continue
+
+		if target == null:
+			return false
+		return target.is_ancestor_of(collider) or collider == target
+
+	return false
 
 func _degrade_object_one_energy(node: Node3D) -> void:
 	if node == null or _build_root == null:

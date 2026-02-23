@@ -18,6 +18,8 @@ var _locked_time: float = 0.0
 var _turn_elapsed: float = 0.0
 var _action_elapsed: float = 0.0
 var _debug_vision_mesh: MeshInstance3D
+var _debug_last_body_hit: String = ""
+var _debug_last_head_hit: String = ""
 
 func _ready() -> void:
 	_refresh_player_refs()
@@ -32,26 +34,30 @@ func _process(delta: float) -> void:
 	var head_pos := head_pivot.global_position
 	var forward := -head_pivot.global_transform.basis.z.normalized()
 
-	var body_vec := _player.global_position - head_pos
+	var body_point := _player_body_target_point()
 	var sees_body := false
-	var body_dist := body_vec.length()
-	if body_dist > 0.001 and body_dist <= scan_range:
-		var body_dir := body_vec / body_dist
-		if forward.dot(body_dir) > cone_dot_threshold:
-			sees_body = _has_line_of_sight_to_player(head_pos, _player.global_position)
+	if _is_within_horizontal_view(head_pos, forward, body_point, scan_range, cone_dot_threshold):
+		sees_body = _has_line_of_sight_to_player(head_pos, body_point, "body")
+	else:
+		_debug_last_body_hit = "out-of-view"
 
 	var sees_head := false
-	if _player_head != null:
-		var head_vec := _player_head.global_position - head_pos
-		var head_dist := head_vec.length()
-		if head_dist > 0.001 and head_dist <= scan_range:
-			var look_dir := head_vec / head_dist
-			if forward.dot(look_dir) > cone_dot_threshold:
-				sees_head = _has_line_of_sight_to_player(head_pos, _player_head.global_position)
+	if _player_head != null and _is_within_horizontal_view(head_pos, forward, _player_head.global_position, scan_range, cone_dot_threshold):
+		sees_head = _has_line_of_sight_to_player(head_pos, _player_head.global_position, "head")
+	else:
+		_debug_last_head_hit = "out-of-view"
 
 	var sees_player := sees_body or sees_head
-
 	var sees_square := sees_player
+
+	if not sees_player and _player != null and _player.has_method("watcher_can_see_player_proxy"):
+		var proxy_player_visible := bool(_player.call("watcher_can_see_player_proxy", self, head_pos, forward, scan_range, cone_dot_threshold))
+		if proxy_player_visible:
+			sees_player = true
+			if _player.has_method("watcher_can_see_player_proxy_ground"):
+				sees_square = bool(_player.call("watcher_can_see_player_proxy_ground", self, head_pos, forward, scan_range, cone_dot_threshold))
+			else:
+				sees_square = true
 
 	var sees_absorbable := false
 	var absorb_cooldown := false
@@ -79,16 +85,28 @@ func _process(delta: float) -> void:
 
 	_update_light()
 	_update_debug_vision_visibility()
-	_report_contact(sees_player, sees_square)
+	var los_debug := "body=%s head=%s" % [_debug_last_body_hit, _debug_last_head_hit]
+	_report_contact(sees_player, sees_square, los_debug)
 	_try_action(delta, forward, head_pos, sees_player, sees_square)
 
-func _can_see_point(point: Vector3, head_pos: Vector3, forward: Vector3, exclude_nodes: Array, target: Node3D = null) -> bool:
-	var to_point := point - head_pos
-	var distance := to_point.length()
-	if distance > scan_range or distance <= 0.001:
+func _is_within_horizontal_view(origin: Vector3, forward: Vector3, point: Vector3, max_distance: float, horizontal_dot_threshold: float) -> bool:
+	var to_point := point - origin
+	var flat_to := Vector3(to_point.x, 0.0, to_point.z)
+	var flat_distance := flat_to.length()
+	if flat_distance > max_distance or flat_distance <= 0.001:
 		return false
-	var dir := to_point / distance
-	if forward.dot(dir) <= cone_dot_threshold:
+
+	var flat_forward := Vector3(forward.x, 0.0, forward.z)
+	var flat_forward_len := flat_forward.length()
+	if flat_forward_len <= 0.001:
+		return false
+
+	var forward_dir := flat_forward / flat_forward_len
+	var target_dir := flat_to / flat_distance
+	return forward_dir.dot(target_dir) > horizontal_dot_threshold
+
+func _can_see_point(point: Vector3, head_pos: Vector3, forward: Vector3, exclude_nodes: Array, target: Node3D = null) -> bool:
+	if not _is_within_horizontal_view(head_pos, forward, point, scan_range, cone_dot_threshold):
 		return false
 	return _has_line_of_sight(head_pos, point, exclude_nodes, target)
 
@@ -110,21 +128,65 @@ func _has_line_of_sight(from: Vector3, to: Vector3, exclude_nodes: Array, target
 		return false
 	return collider == target or target.is_ancestor_of(collider)
 
-func _has_line_of_sight_to_player(from: Vector3, to: Vector3) -> bool:
+func _has_line_of_sight_to_player(from: Vector3, to: Vector3, debug_slot: String = "") -> bool:
 	if _player == null:
+		if debug_slot == "body":
+			_debug_last_body_hit = "no-player"
+		elif debug_slot == "head":
+			_debug_last_head_hit = "no-player"
 		return false
-	var p := PhysicsRayQueryParameters3D.create(from, to)
-	p.collide_with_areas = false
-	p.collide_with_bodies = true
-	p.exclude = []
-	var hit := get_world_3d().direct_space_state.intersect_ray(p)
-	if hit.is_empty():
-		# Unobstructed ray to the point counts as visible player.
-		return true
-	var collider := hit.get("collider") as Node
-	if collider == null:
+
+	var ray_start := from
+	var ray_dir := (to - from).normalized()
+	var exclude_rids: Array = []
+
+	for _attempt in range(2):
+		var p := PhysicsRayQueryParameters3D.create(ray_start, to)
+		p.collide_with_areas = false
+		p.collide_with_bodies = true
+		p.exclude = exclude_rids
+		var hit := get_world_3d().direct_space_state.intersect_ray(p)
+		if hit.is_empty():
+			if debug_slot == "body":
+				_debug_last_body_hit = "empty"
+			elif debug_slot == "head":
+				_debug_last_head_hit = "empty"
+			return true
+
+		var collider := hit.get("collider") as Node
+		var collider_name := "null"
+		if collider != null:
+			collider_name = str(collider.get_path())
+		if debug_slot == "body":
+			_debug_last_body_hit = collider_name
+		elif debug_slot == "head":
+			_debug_last_head_hit = collider_name
+		if collider == null:
+			return false
+
+		# If we hit our own watcher body first, ignore it once and continue.
+		if collider == self or self.is_ancestor_of(collider):
+			if collider.has_method("get_rid"):
+				exclude_rids.append(collider.call("get_rid"))
+			ray_start = (hit.get("position", ray_start) as Vector3) + ray_dir * 0.05
+			continue
+
+		var current := collider
+		while current != null:
+			if current == _player:
+				return true
+			current = current.get_parent()
 		return false
-	return collider == _player or _player.is_ancestor_of(collider)
+
+	return false
+	
+func _player_body_target_point() -> Vector3:
+	if _player == null:
+		return Vector3.ZERO
+	var player_col := _player.get_node_or_null("CollisionShape3D") as CollisionShape3D
+	if player_col != null:
+		return player_col.global_position
+	return _player.global_position + Vector3(0, 1.0, 0)
 
 func _refresh_player_refs() -> void:
 	_player = get_node_or_null(player_path) as Node3D
@@ -136,9 +198,9 @@ func _refresh_player_refs() -> void:
 	if _player != null:
 		_player_head = _player.get_node_or_null("CameraPivot/Camera3D") as Node3D
 
-func _report_contact(sees_player: bool, sees_square: bool) -> void:
+func _report_contact(sees_player: bool, sees_square: bool, los_debug: String = "") -> void:
 	if _player != null and _player.has_method("watcher_update_contact"):
-		_player.call("watcher_update_contact", get_instance_id(), sees_player, sees_square, watcher_kind)
+		_player.call("watcher_update_contact", get_instance_id(), sees_player, sees_square, watcher_kind, los_debug)
 
 func _try_action(delta: float, forward: Vector3, head_pos: Vector3, sees_player: bool, sees_square: bool) -> void:
 	if _player == null or not _player.has_method("watcher_attempt_action"):
