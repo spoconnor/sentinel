@@ -26,7 +26,7 @@ const WATCH_ABSORB_INTERVAL := 5.0
 const WATCH_CONTACT_STALE_SECONDS := 0.7
 const GRID_SIZE := 31
 
-@export var starting_energy: int = 50
+@export var starting_energy: int = 5
 
 var _pitch: float = 0.0
 var _crosshair_layer: CanvasLayer
