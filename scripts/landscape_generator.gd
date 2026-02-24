@@ -4,9 +4,9 @@ enum ObjType { ROBOT, SENTRY, TREE, BOULDER, MEANIE, SENTINEL, PEDESTAL }
 const GROUP_BUILD_PLACEABLE := "build_placeable"
 const GROUP_TRANSFER_ROBOT := "transfer_robot"
 
-@export var seed_bcd: int = 0x0003
-@export var use_generated_bcd: bool = true
-@export var landscape_bcd: int = 0x0003
+@export var seed_bcd: int = 0x0000
+@export var use_generated_bcd: bool = false
+@export var landscape_bcd: int = 0x0000
 @export var tile_size: float = 1.6
 @export var height_scale: float = 0.8
 
@@ -523,8 +523,11 @@ func _object_world_position(o: Dictionary) -> Vector3:
 	return Vector3(center_x, float(o["y"]) * height_scale, center_z) + _terrain_offset
 
 func _spawn_objects(objects: Array) -> void:
-	if has_node("PlacedObjects"):
-		get_node("PlacedObjects").queue_free()
+	# Clean up any previous generated container, including auto-renamed duplicates.
+	for child in get_children():
+		if child is Node and String((child as Node).name).begins_with("PlacedObjects"):
+			remove_child(child)
+			child.queue_free()
 	var root := Node3D.new()
 	root.name = "PlacedObjects"
 	add_child(root)
@@ -557,6 +560,7 @@ func _spawn_objects(objects: Array) -> void:
 
 		if type_id == ObjType.ROBOT:
 			_attach_model_contents(n, ROBOT_MODEL_PATH)
+			_apply_character_palette(n, "robot")
 			mesh_inst.queue_free()
 			build_root.add_child(n)
 			continue
@@ -632,12 +636,14 @@ func _create_object_node(type_id: int, data: Dictionary) -> Node3D:
 		ObjType.ROBOT:
 			node.add_to_group(GROUP_TRANSFER_ROBOT)
 			node.set_meta("object_kind", "robot")
+			node.set_meta("collision_disabled", true)
 			var col := CollisionShape3D.new()
 			var shape := CapsuleShape3D.new()
 			shape.radius = 0.32
 			shape.height = 1.0
 			col.shape = shape
 			col.position.y = 0.85
+			col.disabled = true
 			node.add_child(col)
 		ObjType.TREE:
 			node.set_meta("object_kind", "tree")
@@ -647,6 +653,7 @@ func _create_object_node(type_id: int, data: Dictionary) -> Node3D:
 			shape.height = 2.7
 			col.shape = shape
 			col.position.y = 1.55
+			col.disabled = true
 			node.add_child(col)
 		ObjType.SENTINEL:
 			node.set_meta("object_kind", "sentinel")
@@ -656,6 +663,7 @@ func _create_object_node(type_id: int, data: Dictionary) -> Node3D:
 			shape.height = 3.1
 			col.shape = shape
 			col.position.y = 1.55
+			col.disabled = true
 			node.add_child(col)
 		ObjType.SENTRY:
 			node.set_meta("object_kind", "sentry")
@@ -697,6 +705,94 @@ func _spawn_watcher(root: Node3D, is_sentinel: bool, data: Dictionary) -> void:
 	root.set("scan_range", 32.0 if is_sentinel else 26.0)
 
 	_attach_model_contents(root, SENTINEL_MODEL_PATH if is_sentinel else SENTRY_MODEL_PATH)
+	if is_sentinel:
+		_stylize_sentinel(root)
+	_apply_character_palette(root, "sentinel" if is_sentinel else "sentry")
+
+func _stylize_sentinel(root: Node3D) -> void:
+	if root == null:
+		return
+	# Slim legs, small torso, forward beak to match reference silhouette.
+	var base := root.find_child("Base", true, false) as Node3D
+	if base:
+		base.scale = Vector3(0.7, 0.6, 0.7)
+		base.position.y = 0.15
+	var ankle := root.find_child("Ankle", true, false) as Node3D
+	if ankle:
+		ankle.scale = Vector3(0.55, 1.55, 0.55)
+		ankle.position.y = 0.2
+	var trunk := root.find_child("Trunk", true, false) as Node3D
+	if trunk:
+		trunk.scale = Vector3(0.7, 0.6, 0.7)
+		trunk.position.y = 1.1
+	var shoulder := root.find_child("Shoulder", true, false) as Node3D
+	if shoulder:
+		shoulder.scale = Vector3(0.8, 0.55, 0.8)
+		shoulder.position.y = 1.35
+	var head := root.find_child("Head", true, false) as Node3D
+	if head:
+		head.scale = Vector3(0.6, 0.45, 0.6)
+		head.position.y = 1.55
+	var face := root.find_child("FaceCone", true, false) as Node3D
+	if face:
+		face.scale = Vector3(0.55, 1.6, 0.55)
+		face.position = Vector3(0.0, 1.55, -0.45)
+		face.rotation_degrees.x = -18.0
+	var head_pivot := root.find_child("HeadPivot", true, false) as Node3D
+	if head_pivot:
+		head_pivot.position.y = 1.4
+
+func _apply_character_palette(root: Node3D, kind: String) -> void:
+	var palette := {}
+	if kind == "sentinel":
+		palette = {
+			"Base": Color(0.82, 0.15, 0.12),
+			"Ankle": Color(0.72, 0.12, 0.1),
+			"Trunk": Color(0.86, 0.2, 0.16),
+			"Shoulder": Color(0.75, 0.14, 0.12),
+			"Head": Color(0.08, 0.1, 0.12),
+			"Crown0": Color(0.98, 0.9, 0.28),
+			"Crown1": Color(0.98, 0.9, 0.28),
+			"Crown2": Color(0.98, 0.9, 0.28),
+			"Crown3": Color(0.98, 0.9, 0.28),
+			"Crown4": Color(0.98, 0.9, 0.28),
+			"FaceCone": Color(0.98, 0.9, 0.28),
+			"_default": Color(0.18, 0.18, 0.2),
+		}
+	elif kind == "sentry":
+		palette = {
+			"Base": Color(0.92, 0.72, 0.2),
+			"Shaft": Color(0.86, 0.62, 0.18),
+			"Head": Color(0.12, 0.14, 0.18),
+			"FaceCone": Color(0.96, 0.86, 0.32),
+			"_default": Color(0.2, 0.2, 0.24),
+		}
+	elif kind == "robot":
+		palette = {
+			"Stem": Color(0.08, 0.38, 0.48),
+			"Body": Color(0.08, 0.3, 0.7),
+			"SideL": Color(0.12, 0.5, 0.6),
+			"SideR": Color(0.12, 0.5, 0.6),
+			"Head": Color(0.98, 0.9, 0.28),
+			"_default": Color(0.12, 0.12, 0.14),
+		}
+	_apply_palette_to_meshes(root, palette)
+
+func _apply_palette_to_meshes(root: Node, palette: Dictionary) -> void:
+	if root == null:
+		return
+	if root is MeshInstance3D:
+		var mesh_node := root as MeshInstance3D
+		var key := mesh_node.name
+		var color: Color = palette.get(key, palette.get("_default", Color(0.8, 0.8, 0.8)))
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = color
+		mat.roughness = 0.9
+		mat.metallic = 0.05
+		mesh_node.material_override = mat
+	for child in root.get_children():
+		if child is Node:
+			_apply_palette_to_meshes(child, palette)
 
 func _apply_player_spawn(objects: Array) -> void:
 	var player_obj: Dictionary = {}
@@ -710,5 +806,24 @@ func _apply_player_spawn(objects: Array) -> void:
 	var player := get_node_or_null("../Player") as CharacterBody3D
 	if player == null:
 		return
-	player.global_position = to_global(_object_world_position(player_obj) + Vector3(0, 1.6, 0))
+
+	var square := Vector2i(int(player_obj.get("x", 0)), int(player_obj.get("z", 0)))
+	var ground_y := _square_ground_y(square)
+	var spawn_world := _square_center_world(square, ground_y + 1.65)
+	player.global_position = to_global(spawn_world)
 	player.rotation_degrees.y = float(int(player_obj["rot"])) * 360.0 / 256.0
+
+func _square_center_world(square: Vector2i, y: float) -> Vector3:
+	return Vector3((float(square.x) + 0.5) * tile_size, y, (float(square.y) + 0.5) * tile_size) + _terrain_offset
+
+func _square_ground_y(square: Vector2i) -> float:
+	var center := _square_center_world(square, 0.0)
+	var from := center + Vector3(0, 128.0, 0)
+	var to := center + Vector3(0, -64.0, 0)
+	var p := PhysicsRayQueryParameters3D.create(from, to)
+	p.collide_with_areas = false
+	p.collide_with_bodies = true
+	var hit := get_world_3d().direct_space_state.intersect_ray(p)
+	if hit.is_empty():
+		return center.y
+	return float((hit["position"] as Vector3).y)

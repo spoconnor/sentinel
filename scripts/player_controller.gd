@@ -26,7 +26,7 @@ const WATCH_ABSORB_INTERVAL := 5.0
 const WATCH_CONTACT_STALE_SECONDS := 0.7
 const GRID_SIZE := 31
 
-@export var starting_energy: int = 5
+@export var starting_energy: int = 50
 
 var _pitch: float = 0.0
 var _crosshair_layer: CanvasLayer
@@ -485,6 +485,8 @@ func _node_square(node: Node3D) -> Vector2i:
 	return _world_to_square(node.global_position)
 
 func _set_robot_collision_enabled(robot: StaticBody3D, enabled: bool) -> void:
+	if robot.get_meta("collision_disabled", false):
+		enabled = false
 	for child in robot.get_children():
 		var col := child as CollisionShape3D
 		if col != null:
@@ -563,17 +565,44 @@ func _can_see_pedestal_top_for_square(square: Vector2i) -> bool:
 func _get_base_object_at(square: Vector2i) -> Node3D:
 	if _build_root == null:
 		return null
+	var fallback: Node3D
+	var fallback_level := 999
 	for c in _build_root.get_children():
 		var n := c as Node3D
 		if n == null or not n.is_in_group(GROUP_BUILD_PLACEABLE):
 			continue
-		if int(n.get_meta("stack_level", 0)) != 0:
-			continue
 		var gx := int(n.get_meta("grid_x", 999999))
 		var gz := int(n.get_meta("grid_z", 999999))
-		if gx == square.x and gz == square.y:
+		if gx != square.x or gz != square.y:
+			continue
+		var level := int(n.get_meta("stack_level", 0))
+		if level == 0:
 			return n
-	return null
+		if level < fallback_level:
+			fallback_level = level
+			fallback = n
+	if fallback != null:
+		return fallback
+
+	# Fallback for objects whose grid metadata is stale: infer occupancy by world-space square center.
+	var tile := _get_tile_size()
+	var center := _square_center_world(square, 0.0)
+	var prox_best: Node3D
+	var prox_level := 999
+	var prox_dist := INF
+	for c in _build_root.get_children():
+		var n := c as Node3D
+		if n == null or not n.is_in_group(GROUP_BUILD_PLACEABLE):
+			continue
+		var level := int(n.get_meta("stack_level", 0))
+		var d := Vector2(n.global_position.x - center.x, n.global_position.z - center.z).length()
+		if d > tile * 0.45:
+			continue
+		if level < prox_level or (level == prox_level and d < prox_dist):
+			prox_level = level
+			prox_dist = d
+			prox_best = n
+	return prox_best
 
 func _get_stacked_on_boulder(boulder: Node3D) -> Node3D:
 	if _build_root == null or boulder == null:
@@ -592,7 +621,7 @@ func _get_stacked_on_boulder(boulder: Node3D) -> Node3D:
 func _get_top_object_at_square(square: Vector2i) -> Node3D:
 	var base := _get_base_object_at(square)
 	if base == null:
-		return null
+		return _get_highest_object_at_square(square)
 	if String(base.get_meta("object_kind", "")) != "boulder":
 		return base
 
@@ -605,6 +634,25 @@ func _get_top_object_at_square(square: Vector2i) -> Node3D:
 		if String(current.get_meta("object_kind", "")) != "boulder":
 			return current
 	return base
+
+func _get_highest_object_at_square(square: Vector2i) -> Node3D:
+	if _build_root == null:
+		return null
+	var best: Node3D
+	var best_level := -999
+	for c in _build_root.get_children():
+		var n := c as Node3D
+		if n == null or not n.is_in_group(GROUP_BUILD_PLACEABLE):
+			continue
+		var gx := int(n.get_meta("grid_x", 999999))
+		var gz := int(n.get_meta("grid_z", 999999))
+		if gx != square.x or gz != square.y:
+			continue
+		var level := int(n.get_meta("stack_level", 0))
+		if level > best_level:
+			best_level = level
+			best = n
+	return best
 
 func _get_top_boulder_at_square(square: Vector2i) -> Node3D:
 	var base := _get_base_object_at(square)
@@ -696,6 +744,7 @@ func _create_tree_node(pos: Vector3, square: Vector2i, level: int, support: Node
 	shape.height = 2.7
 	col.shape = shape
 	col.position.y = 1.55
+	col.disabled = true
 	tree.add_child(col)
 
 	_attach_model_contents(tree, TREE_MODEL_PATH)
@@ -722,6 +771,7 @@ func _create_robot_node(pos: Vector3, yaw: float, square: Vector2i, level: int, 
 	var robot := StaticBody3D.new()
 	robot.add_to_group(GROUP_TRANSFER_ROBOT)
 	_tag_build_object(robot, "robot", square, level, support)
+	robot.set_meta("collision_disabled", true)
 	robot.position = pos
 	robot.rotation.y = yaw
 
@@ -731,6 +781,7 @@ func _create_robot_node(pos: Vector3, yaw: float, square: Vector2i, level: int, 
 	body_shape.height = 1.0
 	body_col.shape = body_shape
 	body_col.position.y = 0.85
+	body_col.disabled = true
 	robot.add_child(body_col)
 
 	_attach_model_contents(robot, ROBOT_MODEL_PATH)
@@ -924,7 +975,33 @@ func _try_remove_object() -> void:
 	if target_square == _player_occupied_square():
 		return
 
+	var hit_position := hit.get("position", Vector3.ZERO) as Vector3
 	var top := _get_top_object_at_square(target_square)
+	var tile := _get_tile_size()
+	if top == null:
+		var best_dist := INF
+		for dz in range(-1, 2):
+			for dx in range(-1, 2):
+				if dx == 0 and dz == 0:
+					continue
+				var neighbor := Vector2i(target_square.x + dx, target_square.y + dz)
+				var candidate := _get_top_object_at_square(neighbor)
+				if candidate == null:
+					continue
+				var d := Vector2(hit_position.x - candidate.global_position.x, hit_position.z - candidate.global_position.z).length()
+				if d <= tile * 0.75 and d < best_dist:
+					best_dist = d
+					top = candidate
+	if top == null and _build_root != null:
+		var world_best_dist := INF
+		for c in _build_root.get_children():
+			var candidate := c as Node3D
+			if candidate == null or not candidate.is_in_group(GROUP_BUILD_PLACEABLE):
+				continue
+			var d := Vector2(hit_position.x - candidate.global_position.x, hit_position.z - candidate.global_position.z).length()
+			if d <= tile * 0.55 and d < world_best_dist:
+				world_best_dist = d
+				top = candidate
 	if top == null:
 		return
 	if _active_robot != null and top == _active_robot:
@@ -958,8 +1035,12 @@ func _try_transfer_to_robot() -> void:
 		var boulder := _find_boulder_root(collider)
 		if boulder != null:
 			target_square = _node_square(boulder)
-		elif _is_horizontal_surface(hit):
-			target_square = _world_to_square(hit["position"])
+		else:
+			var pedestal := _find_pedestal_root(collider)
+			if pedestal != null and _is_pedestal_top_hit(pedestal, hit):
+				target_square = _node_square(pedestal)
+			elif _is_horizontal_surface(hit):
+				target_square = _world_to_square(hit["position"])
 
 		if target_square.x != 999999:
 			target_robot = _get_robot_at_square(target_square)
