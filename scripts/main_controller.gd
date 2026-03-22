@@ -10,7 +10,10 @@ var _message_label: Label
 var _play_button: Button
 
 func _ready() -> void:
-	_current_map_level = int(_landscape.get("landscape_bcd"))
+	if _landscape != null and _landscape.has_method("landscape_bcd_to_level_number"):
+		_current_map_level = int(_landscape.call("landscape_bcd_to_level_number", int(_landscape.get("landscape_bcd"))))
+	else:
+		_current_map_level = int(_landscape.get("landscape_bcd"))
 	_create_intro_ui()
 	if _player != null and _player.has_signal("game_won"):
 		_player.connect("game_won", Callable(self, "_on_game_won"))
@@ -74,7 +77,7 @@ func _show_intro(message: String) -> void:
 
 func _update_intro_labels(message: String) -> void:
 	if _level_label != null:
-		_level_label.text = "Map Level: %d" % _current_map_level
+		_level_label.text = "Map Level: %04d" % _current_map_level
 	if _message_label != null:
 		_message_label.text = message
 
@@ -89,6 +92,6 @@ func _on_play_pressed() -> void:
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 
 func _on_game_won(ending_energy: int) -> void:
-	var bonus := int(ceil(float(max(0, ending_energy)) / 5.0))
+	var bonus := int(ceil(float(max(0, ending_energy))))
 	_current_map_level += bonus
 	_show_intro("Victory! Level +%d" % bonus)

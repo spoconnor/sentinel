@@ -6,46 +6,98 @@ const GROUP_TRANSFER_ROBOT := "transfer_robot"
 
 @export var seed_bcd: int = 0x0000
 @export var use_generated_bcd: bool = false
+@export var use_cpc_code: bool = false
+@export var cpc_code: String = ""
 @export var landscape_bcd: int = 0x0000
 @export var tile_size: float = 1.6
-@export var height_scale: float = 0.8
+@export var height_scale: float = 2.0
 
 var _ull: int = 0
+var _rng_usage: int = 0
+var _cpc_code_to_level: Dictionary = {}
 var _terrain_offset := Vector3.ZERO
 var _sentinel_script := load("res://scripts/sentinel.gd")
+var _model_utils := preload("res://scripts/model_utils.gd")
 const ROBOT_MODEL_PATH := "res://models/robot.glb"
 const TREE_MODEL_PATH := "res://models/tree.glb"
 const BOULDER_MODEL_PATH := "res://models/boulder.glb"
+const ROBOT_VISUAL_SCALE := 0.75
 const PEDESTAL_MODEL_PATH := "res://models/pedestal.glb"
 const SENTRY_MODEL_PATH := "res://models/sentry.glb"
 const SENTINEL_MODEL_PATH := "res://models/sentinel.glb"
+const PEDESTAL_VISUAL_LIFT := 0.42
+const PEDESTAL_TOP_HEIGHT := 0.84
+const CPC_CODES_PATH := "res://example_code/sentinel_codes.txt"
+const WATCHER_TURN_STEP_SCALE := 0.25
+const WATCHER_TURN_TIMER_SCALE := 0.25
+const WATCHER_VIEW_DOT_THRESHOLD := 0.9986295
+const WATCHER_LIGHT_SPOT_ANGLE := 6.5
 
 func _ready() -> void:
 	_generate_level_objects()
 
+func level_number_to_bcd(level_number: int) -> int:
+	var clamped := clampi(level_number, 0, 9999)
+	return (
+		((clamped / 1000) % 10) << 12 |
+		((clamped / 100) % 10) << 8 |
+		((clamped / 10) % 10) << 4 |
+		(clamped % 10)
+	)
+
+func landscape_bcd_to_level_number(level_bcd: int) -> int:
+	return (
+		((level_bcd >> 12) & 0xF) * 1000 +
+		((level_bcd >> 8) & 0xF) * 100 +
+		((level_bcd >> 4) & 0xF) * 10 +
+		(level_bcd & 0xF)
+	)
+
+func is_valid_bcd_level(level_bcd: int) -> bool:
+	if level_bcd < 0 or level_bcd > 0x9999:
+		return false
+	for shift in [0, 4, 8, 12]:
+		if ((level_bcd >> shift) & 0xF) > 9:
+			return false
+	return true
+
 func regenerate_level(new_level: int) -> void:
-	landscape_bcd = new_level & 0xFFFF
+	landscape_bcd = level_number_to_bcd(new_level)
+	use_cpc_code = false
 	_generate_level_objects()
+
+func regenerate_level_from_cpc_code(code: String) -> bool:
+	var decoded := cpc_code_to_landscape_bcd(code)
+	if decoded < 0:
+		return false
+	cpc_code = _normalize_cpc_code(code)
+	use_cpc_code = true
+	landscape_bcd = decoded
+	_generate_level_objects()
+	return true
 
 func _generate_level_objects() -> void:
 	var bcd := landscape_bcd
 	if use_generated_bcd:
+		if not is_valid_bcd_level(seed_bcd):
+			push_error("seed_bcd must be a 4-digit BCD landscape value in the range 0x0000..0x9999")
+			return
 		bcd = _generate_landscape_bcd_from_sentcode(seed_bcd)
+	elif use_cpc_code:
+		var decoded := cpc_code_to_landscape_bcd(cpc_code)
+		if decoded < 0:
+			push_error("Invalid CPC code: %s" % cpc_code)
+			return
+		bcd = decoded
+	elif not is_valid_bcd_level(bcd):
+		push_error("landscape_bcd must be a 4-digit BCD landscape value in the range 0x0000..0x9999")
+		return
 	landscape_bcd = bcd
 
-	var maparr := _generate_landscape(bcd)
+	var level_data := generate_level_snapshot(bcd)
+	var maparr: Array = level_data["map"]
 	_build_mesh(maparr)
-
-	var sentry_data := _place_sentries(bcd, maparr)
-	var objects: Array = sentry_data["objects"]
-	var max_height: int = sentry_data["max_height"]
-
-	var player_data := _place_player(bcd, max_height, objects, maparr)
-	objects = player_data["objects"]
-	max_height = player_data["max_height"]
-
-	var tree_data := _place_trees(max_height, objects, maparr)
-	objects = tree_data["objects"]
+	var objects: Array = level_data["objects"]
 
 	call_deferred("_spawn_generated_objects", objects)
 	print("Generated landscape_bcd=0x%04X, objects=%d" % [bcd, objects.size()])
@@ -66,11 +118,13 @@ func _cache_sentinel_start_square(objects: Array) -> void:
 
 func _seed(land_bcd: int) -> void:
 	_ull = (1 << 16) | (land_bcd & 0xFFFF)
+	_rng_usage = 0
 
 func _rng() -> int:
 	for _i in range(8):
 		_ull <<= 1
 		_ull |= ((_ull >> 20) ^ (_ull >> 33)) & 1
+	_rng_usage += 1
 	return (_ull >> 32) & 0xFF
 
 func _rng_bcd_digits() -> int:
@@ -94,6 +148,9 @@ func _rng_00_16() -> int:
 	return (r & 7) + ((r >> 3) & 0xF)
 
 func _generate_landscape(land_bcd: int) -> Array:
+	return generate_landscape_pipeline(land_bcd)["swap"]
+
+func generate_landscape_pipeline(land_bcd: int) -> Dictionary:
 	_seed(land_bcd)
 	for _i in range(0x51):
 		_rng()
@@ -110,22 +167,120 @@ func _generate_landscape(land_bcd: int) -> Array:
 		row.reverse()
 		maparr.append(row)
 	maparr.reverse()
+	var stages := {
+		"random": _copy_map(maparr),
+	}
 
+	var smooth_stage := 0
 	for _p in range(2):
 		maparr = _smooth_map(maparr, true)
+		stages["smooth%d" % smooth_stage] = _copy_map(maparr)
+		smooth_stage += 1
 		maparr = _smooth_map(maparr, false)
+		stages["smooth%d" % smooth_stage] = _copy_map(maparr)
+		smooth_stage += 1
 
 	for z in range(0x20):
 		for x in range(0x20):
 			maparr[z][x] = _scale_and_offset(maparr[z][x], hscale)
+	stages["scaled"] = _copy_map(maparr)
 
+	var despike_stage := 0
 	for _p in range(2):
 		maparr = _despike_map(maparr, true)
+		stages["despike%d" % despike_stage] = _copy_map(maparr)
+		despike_stage += 1
 		maparr = _despike_map(maparr, false)
+		stages["despike%d" % despike_stage] = _copy_map(maparr)
+		despike_stage += 1
 
 	maparr = _add_tile_shapes(maparr)
+	stages["shape"] = _copy_map(maparr)
 	maparr = _swap_nibbles(maparr)
-	return maparr
+	stages["swap"] = _copy_map(maparr)
+	return stages
+
+func generate_level_snapshot(land_bcd: int) -> Dictionary:
+	var stages := generate_landscape_pipeline(land_bcd)
+	var maparr: Array = stages["swap"]
+
+	var sentry_data := _place_sentries(land_bcd, maparr)
+	var objects: Array = sentry_data["objects"]
+	var max_height: int = sentry_data["max_height"]
+
+	var player_data := _place_player(land_bcd, max_height, objects, maparr)
+	objects = player_data["objects"]
+	max_height = player_data["max_height"]
+
+	var tree_data := _place_trees(max_height, objects, maparr)
+	objects = tree_data["objects"]
+
+	return {
+		"stages": stages,
+		"map": maparr,
+		"objects": objects,
+		"max_height": max_height,
+		"rng_usage": _rng_usage,
+		"rng_state": _ull,
+	}
+
+func map_to_memory_bytes(maparr: Array) -> PackedByteArray:
+	var bytes := PackedByteArray()
+	bytes.resize(0x400)
+	for offset in range(0x400):
+		var coord := _get_x_z_from_offset(offset)
+		bytes[offset] = int(maparr[coord.y][coord.x]) & 0xFF
+	return bytes
+
+func cpc_code_to_landscape_bcd(code: String) -> int:
+	_ensure_cpc_code_table_loaded()
+	var normalized := _normalize_cpc_code(code)
+	if normalized.is_empty():
+		return -1
+	return int(_cpc_code_to_level.get(normalized, -1))
+
+func _copy_map(maparr: Array) -> Array:
+	return maparr.duplicate(true)
+
+func _get_x_z_from_offset(offset: int) -> Vector2i:
+	var x := ((offset & 0x300) >> 8) | ((offset & 0xE0) >> 3)
+	var z := offset & 0x1F
+	return Vector2i(x, z)
+
+func _normalize_cpc_code(code: String) -> String:
+	return code.strip_edges()
+
+func _ensure_cpc_code_table_loaded() -> void:
+	if not _cpc_code_to_level.is_empty():
+		return
+	var file := FileAccess.open(CPC_CODES_PATH, FileAccess.READ)
+	if file == null:
+		push_error("Unable to open CPC code table: %s" % CPC_CODES_PATH)
+		return
+
+	while not file.eof_reached():
+		var line := file.get_line().strip_edges()
+		if not line.begins_with("|"):
+			continue
+		var parts := line.split("|", false)
+		if parts.size() < 3:
+			continue
+		var land := String(parts[0]).strip_edges()
+		var cpc := String(parts[2]).strip_edges()
+		if land.length() != 4 or cpc.length() != 8:
+			continue
+		if not _is_decimal_digits(cpc):
+			continue
+		_cpc_code_to_level[cpc] = land.hex_to_int()
+
+func _is_decimal_digits(text: String) -> bool:
+	if text.is_empty():
+		return false
+	for i in range(text.length()):
+		var c := text.unicode_at(i)
+		if c < 48 or c > 57:
+			return false
+	return true
 
 func _wrapped_slice(maparr: Array, entries: int, by_z: bool, idx: int) -> Array:
 	var out: Array = []
@@ -203,7 +358,7 @@ func _despike_map(maparr: Array, by_z: bool) -> Array:
 
 func _scale_and_offset(v: int, scale_value: int) -> int:
 	var mag := v - 0x80
-	mag = (mag * scale_value) / 256
+	mag = floori(float(mag * scale_value) / 256.0)
 	mag = maxi(mag + 6, 0)
 	mag = mini(mag + 1, 11)
 	return mag
@@ -384,6 +539,12 @@ func _leading_zeros_7bit(v: int) -> int:
 			return 6 - i
 	return 7
 
+func _mask_for_count(count: int) -> int:
+	var mask := 1
+	while mask < count:
+		mask = (mask << 1) | 1
+	return mask
+
 func _calc_num_sentries(landscape_bcd_value: int) -> int:
 	if landscape_bcd_value == 0x0000:
 		return 1
@@ -452,7 +613,7 @@ func _place_sentries(landscape_bcd_value: int, maparr: Array) -> Dictionary:
 					height_indices.append(idx)
 			if height_indices.size() > 0:
 				height_indices.reverse()
-				var idx_mask := 0xFF >> _leading_zeros_7bit(height_indices.size() - 1)
+				var idx_mask := _mask_for_count(height_indices.size())
 				var idx_choice := 0
 				while true:
 					idx_choice = _rng() & idx_mask
@@ -541,10 +702,13 @@ func _spawn_objects(objects: Array) -> void:
 		var type_id := int(o["type"])
 		var n := _create_object_node(type_id, o)
 		n.position = _object_world_position(o)
+		if type_id == ObjType.SENTINEL:
+			n.position.y += PEDESTAL_TOP_HEIGHT - height_scale
 		n.rotation_degrees.y = float(int(o["rot"])) * 360.0 / 256.0
 
 		if type_id == ObjType.TREE:
-			_attach_model_contents(n, TREE_MODEL_PATH)
+			var tree_visuals := _attach_model_contents(n, TREE_MODEL_PATH)
+			_normalize_model_nodes(n, tree_visuals)
 			build_root.add_child(n)
 			continue
 
@@ -559,7 +723,9 @@ func _spawn_objects(objects: Array) -> void:
 		mesh_inst.material_override = mat
 
 		if type_id == ObjType.ROBOT:
-			_attach_model_contents(n, ROBOT_MODEL_PATH)
+			var robot_visuals := _attach_model_contents(n, ROBOT_MODEL_PATH)
+			_scale_model_nodes(robot_visuals, ROBOT_VISUAL_SCALE)
+			_normalize_model_nodes(n, robot_visuals)
 			_apply_character_palette(n, "robot")
 			mesh_inst.queue_free()
 			build_root.add_child(n)
@@ -571,6 +737,7 @@ func _spawn_objects(objects: Array) -> void:
 			mesh_inst.position.y = 0.8
 			mat.albedo_color = Color(1.0, 0.35, 0.2)
 		elif type_id == ObjType.PEDESTAL:
+			n.position.y += PEDESTAL_VISUAL_LIFT
 			_attach_model_contents(n, PEDESTAL_MODEL_PATH)
 			mesh_inst.queue_free()
 			root.add_child(n)
@@ -602,22 +769,14 @@ func _ensure_build_root() -> Node3D:
 	scene_root.add_child(created)
 	return created
 
-func _attach_model_contents(parent: Node3D, model_path: String) -> void:
-	if parent == null or model_path == "":
-		return
-	var packed := ResourceLoader.load(model_path) as PackedScene
-	if packed == null:
-		return
-	var inst := packed.instantiate() as Node3D
-	if inst == null:
-		return
-	parent.add_child(inst)
-	for child in inst.get_children():
-		inst.remove_child(child)
-		if child is Node:
-			(child as Node).owner = null
-		parent.add_child(child)
-	inst.queue_free()
+func _attach_model_contents(parent: Node3D, model_path: String) -> Array:
+	return _model_utils.attach_model_contents(parent, model_path)
+
+func _scale_model_nodes(nodes: Array, scale_factor: float) -> void:
+	_model_utils.scale_nodes(nodes, scale_factor)
+
+func _normalize_model_nodes(parent: Node3D, nodes: Array) -> void:
+	_model_utils.center_and_ground_nodes(parent, nodes)
 
 func _create_object_node(type_id: int, data: Dictionary) -> Node3D:
 	var is_build_object := type_id == ObjType.ROBOT or type_id == ObjType.TREE or type_id == ObjType.SENTRY or type_id == ObjType.SENTINEL or type_id == ObjType.PEDESTAL
@@ -677,6 +836,7 @@ func _create_object_node(type_id: int, data: Dictionary) -> Node3D:
 		ObjType.PEDESTAL:
 			node.set_meta("object_kind", "pedestal")
 			var col := CollisionShape3D.new()
+			col.position.y = PEDESTAL_VISUAL_LIFT
 			var shape := ConvexPolygonShape3D.new()
 			var points := PackedVector3Array()
 			var r := 0.78
@@ -696,51 +856,128 @@ func _spawn_watcher(root: Node3D, is_sentinel: bool, data: Dictionary) -> void:
 	root.set_script(_sentinel_script)
 	root.set("player_path", NodePath("../../Player"))
 	root.set("watcher_kind", "sentinel" if is_sentinel else "sentry")
-	var step_degrees := float(int(data.get("step", 20)))
-	var timer_seconds := float(int(data.get("timer", 20)))
+	var step_degrees := float(int(data.get("step", 20))) * WATCHER_TURN_STEP_SCALE
+	var timer_seconds := float(int(data.get("timer", 20))) * WATCHER_TURN_TIMER_SCALE
 	root.set("step", step_degrees)
 	root.set("timer", maxf(0.1, timer_seconds))
 	root.set("rotation_speed", 0.0)
 	root.set_process(true)
-	root.set("scan_range", 32.0 if is_sentinel else 26.0)
+	root.set("scan_range", 80.0 if is_sentinel else 26.0)
+	root.set("cone_dot_threshold", WATCHER_VIEW_DOT_THRESHOLD)
 
-	_attach_model_contents(root, SENTINEL_MODEL_PATH if is_sentinel else SENTRY_MODEL_PATH)
+	var visuals := _attach_model_contents(root, SENTINEL_MODEL_PATH if is_sentinel else SENTRY_MODEL_PATH)
+	_restore_watcher_tags(root, "sentinel" if is_sentinel else "sentry")
 	if is_sentinel:
 		_stylize_sentinel(root)
+	_normalize_model_nodes(root, visuals)
 	_apply_character_palette(root, "sentinel" if is_sentinel else "sentry")
+
+func _restore_watcher_tags(root: Node3D, watcher_kind: String) -> void:
+	if root == null:
+		return
+
+	var head_pivot := root.get_node_or_null("HeadPivot") as Node3D
+	if head_pivot == null:
+		var nested_head_pivot := root.find_child("HeadPivot", true, false) as Node3D
+		if nested_head_pivot != null:
+			var old_parent := nested_head_pivot.get_parent()
+			if old_parent != null and old_parent != root:
+				old_parent.remove_child(nested_head_pivot)
+				nested_head_pivot.owner = null
+				root.add_child(nested_head_pivot)
+			head_pivot = nested_head_pivot
+	if head_pivot == null:
+		head_pivot = Node3D.new()
+		head_pivot.name = "HeadPivot"
+		head_pivot.position.y = 1.4 if watcher_kind == "sentinel" else 1.2
+		root.add_child(head_pivot)
+
+	head_pivot.rotation_degrees.x = 0.0
+
+	if root.get_node_or_null("Base") == null:
+		var cube_base := root.get_node_or_null("Cube") as Node3D
+		if cube_base != null:
+			cube_base.name = "Base"
+
+	var eye_light := head_pivot.get_node_or_null("EyeLight") as SpotLight3D
+	if eye_light == null:
+		eye_light = SpotLight3D.new()
+		eye_light.name = "EyeLight"
+		eye_light.position = Vector3(0, 0, -0.42) if watcher_kind == "sentinel" else Vector3(0, 0, -0.25)
+		eye_light.rotation_degrees.x = -5.0
+		eye_light.spot_range = 24.0 if watcher_kind == "sentinel" else 20.0
+		eye_light.spot_angle = WATCHER_LIGHT_SPOT_ANGLE
+		eye_light.light_energy = 2.7
+		head_pivot.add_child(eye_light)
 
 func _stylize_sentinel(root: Node3D) -> void:
 	if root == null:
 		return
-	# Slim legs, small torso, forward beak to match reference silhouette.
+
 	var base := root.find_child("Base", true, false) as Node3D
+	var ankle := root.find_child("Ankle", true, false) as Node3D
+	var trunk := root.find_child("Trunk", true, false) as Node3D
+	var shoulder := root.find_child("Shoulder", true, false) as Node3D
+	var head := root.find_child("Head", true, false) as Node3D
+	var face := root.find_child("FaceCone", true, false) as Node3D
+	var head_pivot := root.find_child("HeadPivot", true, false) as Node3D
+
+	# Edited sentinel.glb is a minimal two-part model. Keep the head sitting directly on top
+	# of the cube body and scale the visuals to about 10% taller than the robot.
+	if ankle == null and trunk == null and shoulder == null and face == null:
+		var base_mesh := base as MeshInstance3D
+		var head_mesh := head as MeshInstance3D
+		if base_mesh != null:
+			base_mesh.scale *= 0.56
+			base_mesh.position *= 0.56
+			base_mesh.position.x = 0.0
+			base_mesh.position.z = 0.0
+		if head_mesh != null:
+			head_mesh.scale *= 0.56
+			head_mesh.position = Vector3.ZERO
+		if head_pivot != null and base_mesh != null and head_mesh != null:
+			var cube_top := _mesh_local_top(base_mesh)
+			var head_bottom := _mesh_local_bottom(head_mesh)
+			head_pivot.position = Vector3(0.0, cube_top - head_bottom + 0.02, 0.0)
+			var eye_light := head_pivot.get_node_or_null("EyeLight") as SpotLight3D
+			if eye_light != null:
+				eye_light.position = Vector3(0.0, 0.0, -0.42)
+		return
+
+	# Slim legs, small torso, forward beak to match reference silhouette.
 	if base:
 		base.scale = Vector3(0.7, 0.6, 0.7)
 		base.position.y = 0.15
-	var ankle := root.find_child("Ankle", true, false) as Node3D
 	if ankle:
 		ankle.scale = Vector3(0.55, 1.55, 0.55)
 		ankle.position.y = 0.2
-	var trunk := root.find_child("Trunk", true, false) as Node3D
 	if trunk:
 		trunk.scale = Vector3(0.7, 0.6, 0.7)
 		trunk.position.y = 1.1
-	var shoulder := root.find_child("Shoulder", true, false) as Node3D
 	if shoulder:
 		shoulder.scale = Vector3(0.8, 0.55, 0.8)
 		shoulder.position.y = 1.35
-	var head := root.find_child("Head", true, false) as Node3D
 	if head:
 		head.scale = Vector3(0.6, 0.45, 0.6)
 		head.position.y = 1.55
-	var face := root.find_child("FaceCone", true, false) as Node3D
 	if face:
 		face.scale = Vector3(0.55, 1.6, 0.55)
 		face.position = Vector3(0.0, 1.55, -0.45)
 		face.rotation_degrees.x = -18.0
-	var head_pivot := root.find_child("HeadPivot", true, false) as Node3D
 	if head_pivot:
 		head_pivot.position.y = 1.4
+
+func _mesh_local_top(mesh_node: MeshInstance3D) -> float:
+	if mesh_node == null or mesh_node.mesh == null:
+		return mesh_node.position.y if mesh_node != null else 0.0
+	var aabb := mesh_node.mesh.get_aabb()
+	return mesh_node.position.y + (aabb.position.y + aabb.size.y) * mesh_node.scale.y
+
+func _mesh_local_bottom(mesh_node: MeshInstance3D) -> float:
+	if mesh_node == null or mesh_node.mesh == null:
+		return mesh_node.position.y if mesh_node != null else 0.0
+	var aabb := mesh_node.mesh.get_aabb()
+	return mesh_node.position.y + aabb.position.y * mesh_node.scale.y
 
 func _apply_character_palette(root: Node3D, kind: String) -> void:
 	var palette := {}

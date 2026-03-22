@@ -5,6 +5,7 @@ signal game_won(ending_energy: int)
 @export var gravity: float = 12.0
 @export var interact_distance: float = 200.0
 @export var place_normal_dot_min: float = 0.98
+@export var force_mobile_controls: bool = true
 
 @onready var camera_pivot: Node3D = $CameraPivot
 @onready var camera: Camera3D = $CameraPivot/Camera3D
@@ -25,12 +26,18 @@ const WATCH_DRAIN_INTERVAL := 5.0
 const WATCH_ABSORB_INTERVAL := 5.0
 const WATCH_CONTACT_STALE_SECONDS := 0.7
 const GRID_SIZE := 31
+const BOULDER_HEIGHT := 1.0164
+const BOULDER_HALF_HEIGHT := BOULDER_HEIGHT * 0.5
+const BOULDER_VISUAL_SCALE := 1.21
 
-@export var starting_energy: int = 5
+
+@export var starting_energy: int = 50
 
 var _pitch: float = 0.0
 var _crosshair_layer: CanvasLayer
 var _energy_layer: CanvasLayer
+var _mobile_layer: CanvasLayer
+var _mobile_root: Control
 var _energy_label: Label
 var _warning_label: Label
 var _debug_label: Label
@@ -56,10 +63,12 @@ var _watch_seen_timer: float = 0.0
 var _watch_drain_timer: float = 0.0
 var _meanie_cooldowns: Dictionary = {}
 var _watcher_script := load("res://scripts/sentinel.gd")
+var _model_utils := preload("res://scripts/model_utils.gd")
 const ROBOT_MODEL_PATH := "res://models/robot.glb"
 const TREE_MODEL_PATH := "res://models/tree.glb"
 const BOULDER_MODEL_PATH := "res://models/boulder.glb"
 const MEANIE_MODEL_PATH := "res://models/meanie.glb"
+const ROBOT_VISUAL_SCALE := 0.75
 
 func _ready() -> void:
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
@@ -67,6 +76,7 @@ func _ready() -> void:
 	call_deferred("_ensure_build_root")
 	call_deferred("_create_crosshair")
 	call_deferred("_create_energy_ui")
+	call_deferred("_create_mobile_controls")
 	call_deferred("_ensure_start_robot_host")
 	call_deferred("_cache_sentinel_start_square")
 
@@ -229,6 +239,175 @@ func _create_energy_ui() -> void:
 	_update_energy_ui()
 	_update_warning_ui(false, false)
 	_update_debug_ui()
+
+func _should_show_mobile_controls() -> bool:
+	if force_mobile_controls:
+		return true
+	if DisplayServer.is_touchscreen_available():
+		return true
+	if OS.has_feature("mobile"):
+		return true
+	return false
+
+func _create_mobile_controls() -> void:
+	if not _should_show_mobile_controls():
+		return
+	var root := get_tree().current_scene
+	if root == null:
+		return
+	if root.get_node_or_null("MobileControls") != null:
+		return
+
+	_mobile_layer = CanvasLayer.new()
+	_mobile_layer.name = "MobileControls"
+	_mobile_layer.layer = 20
+	root.add_child(_mobile_layer)
+
+	_mobile_root = Control.new()
+	_mobile_root.name = "MobileRoot"
+	_mobile_root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_mobile_root.mouse_filter = Control.MOUSE_FILTER_PASS
+	_mobile_layer.add_child(_mobile_root)
+
+	var panel := PanelContainer.new()
+	var panel_size := Vector2(300, 160)
+	panel.custom_minimum_size = panel_size
+	panel.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+	panel.position = Vector2(-panel_size.x - 12, -panel_size.y - 12)
+	panel.size = panel_size
+	_mobile_root.add_child(panel)
+
+	var grid := GridContainer.new()
+	grid.columns = 4
+	grid.add_theme_constant_override("separation", 8)
+	panel.add_child(grid)
+
+	var actions := [
+		{"id": "tree", "icon": "tree", "tooltip": "Place Tree"},
+		{"id": "boulder", "icon": "boulder", "tooltip": "Place Boulder"},
+		{"id": "robot", "icon": "robot", "tooltip": "Place Robot"},
+		{"id": "transfer", "icon": "transfer", "tooltip": "Transfer"},
+		{"id": "remove", "icon": "remove", "tooltip": "Remove"},
+		{"id": "hyperspace", "icon": "hyperspace", "tooltip": "Hyperspace"},
+		{"id": "debug", "icon": "debug", "tooltip": "Debug"},
+		{"id": "isolate", "icon": "isolate", "tooltip": "Isolate"},
+	]
+
+	for entry in actions:
+		var btn := _make_mobile_action_button(String(entry["id"]), String(entry["icon"]), String(entry["tooltip"]))
+		grid.add_child(btn)
+
+func _make_mobile_action_button(action_id: String, icon_kind: String, tooltip: String) -> Button:
+	var btn := Button.new()
+	btn.text = ""
+	btn.tooltip_text = tooltip
+	btn.custom_minimum_size = Vector2(64, 64)
+	btn.focus_mode = Control.FOCUS_NONE
+	btn.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_CENTER
+	btn.expand_icon = true
+	btn.icon = _make_icon_texture(icon_kind, Color(0.94, 0.94, 0.96, 1.0))
+	btn.pressed.connect(func() -> void: _on_mobile_action(action_id))
+	return btn
+
+func _on_mobile_action(action_id: String) -> void:
+	if not _round_active or _lost or _won:
+		return
+	match action_id:
+		"tree":
+			_try_place_tree()
+		"boulder":
+			_try_place_boulder()
+		"robot":
+			_try_place_robot()
+		"transfer":
+			_try_transfer_to_robot()
+		"remove":
+			_try_remove_object()
+		"hyperspace":
+			_try_hyperspace()
+		"debug":
+			_set_debug_mode(not _debug_mode)
+		"isolate":
+			_toggle_sentinel_isolate_mode()
+
+func _make_icon_texture(kind: String, color: Color, size: int = 48) -> Texture2D:
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0, 0, 0, 0))
+	var accent := Color(0.12, 0.12, 0.12, 1.0)
+	var mid := int(size / 2)
+
+	match kind:
+		"tree":
+			var top := int(size * 0.15)
+			var bottom := int(size * 0.62)
+			for y in range(top, bottom):
+				var t := float(y - top) / float(max(1, bottom - top))
+				var half := int((1.0 - t) * size * 0.24) + 2
+				for x in range(mid - half, mid + half + 1):
+					img.set_pixel(x, y, color)
+			_draw_rect(img, Rect2i(mid - 2, int(size * 0.62), 5, int(size * 0.22)), color)
+		"boulder":
+			_draw_circle(img, Vector2i(mid, int(size * 0.58)), int(size * 0.22), color)
+		"robot":
+			_draw_rect(img, Rect2i(mid - 10, int(size * 0.34), 20, 18), color)
+			_draw_rect(img, Rect2i(mid - 6, int(size * 0.18), 12, 10), color)
+			img.set_pixel(mid - 4, int(size * 0.22), accent)
+			img.set_pixel(mid + 4, int(size * 0.22), accent)
+		"transfer":
+			_draw_rect(img, Rect2i(mid + 6, int(size * 0.34), 12, 12), color)
+			_draw_line(img, Vector2i(int(size * 0.20), mid), Vector2i(int(size * 0.62), mid), color)
+			_draw_line(img, Vector2i(int(size * 0.52), mid - 6), Vector2i(int(size * 0.62), mid), color)
+			_draw_line(img, Vector2i(int(size * 0.52), mid + 6), Vector2i(int(size * 0.62), mid), color)
+		"remove":
+			_draw_line(img, Vector2i(int(size * 0.24), int(size * 0.24)), Vector2i(int(size * 0.76), int(size * 0.76)), color)
+			_draw_line(img, Vector2i(int(size * 0.76), int(size * 0.24)), Vector2i(int(size * 0.24), int(size * 0.76)), color)
+		"hyperspace":
+			_draw_line(img, Vector2i(mid, int(size * 0.18)), Vector2i(mid, int(size * 0.82)), color)
+			_draw_line(img, Vector2i(int(size * 0.18), mid), Vector2i(int(size * 0.82), mid), color)
+			_draw_line(img, Vector2i(int(size * 0.28), int(size * 0.28)), Vector2i(int(size * 0.72), int(size * 0.72)), color)
+			_draw_line(img, Vector2i(int(size * 0.72), int(size * 0.28)), Vector2i(int(size * 0.28), int(size * 0.72)), color)
+		"debug":
+			_draw_rect(img, Rect2i(mid - 12, int(size * 0.26), 24, 20), color)
+			_draw_rect(img, Rect2i(mid - 8, int(size * 0.30), 16, 12), accent)
+			img.set_pixel(mid - 4, int(size * 0.34), color)
+			img.set_pixel(mid + 4, int(size * 0.34), color)
+		"isolate":
+			_draw_circle(img, Vector2i(mid, mid), int(size * 0.22), color)
+			_draw_circle(img, Vector2i(mid, mid), int(size * 0.06), color)
+
+	return ImageTexture.create_from_image(img)
+
+func _draw_rect(img: Image, rect: Rect2i, color: Color) -> void:
+	for y in range(rect.position.y, rect.position.y + rect.size.y):
+		for x in range(rect.position.x, rect.position.x + rect.size.x):
+			if x >= 0 and x < img.get_width() and y >= 0 and y < img.get_height():
+				img.set_pixel(x, y, color)
+
+func _draw_circle(img: Image, center: Vector2i, radius: int, color: Color) -> void:
+	var r2 := radius * radius
+	for y in range(center.y - radius, center.y + radius + 1):
+		for x in range(center.x - radius, center.x + radius + 1):
+			var dx := x - center.x
+			var dy := y - center.y
+			if dx * dx + dy * dy <= r2:
+				if x >= 0 and x < img.get_width() and y >= 0 and y < img.get_height():
+					img.set_pixel(x, y, color)
+
+func _draw_line(img: Image, from: Vector2i, to: Vector2i, color: Color) -> void:
+	var dx := to.x - from.x
+	var dy := to.y - from.y
+	var steps: int = int(max(abs(dx), abs(dy)))
+	if steps == 0:
+		if from.x >= 0 and from.x < img.get_width() and from.y >= 0 and from.y < img.get_height():
+			img.set_pixel(from.x, from.y, color)
+		return
+	for i in range(steps + 1):
+		var t := float(i) / float(steps)
+		var x := int(round(from.x + dx * t))
+		var y := int(round(from.y + dy * t))
+		if x >= 0 and x < img.get_width() and y >= 0 and y < img.get_height():
+			img.set_pixel(x, y, color)
 
 func _update_energy_ui() -> void:
 	if _energy_label == null:
@@ -716,22 +895,8 @@ func _tag_build_object(node: Node3D, kind: String, square: Vector2i, level: int,
 	node.set_meta("stack_level", level)
 	node.set_meta("support_boulder_id", -1 if support_boulder == null else int(support_boulder.get_instance_id()))
 
-func _attach_model_contents(parent: Node3D, model_path: String) -> void:
-	if parent == null or model_path == "":
-		return
-	var packed := ResourceLoader.load(model_path) as PackedScene
-	if packed == null:
-		return
-	var inst := packed.instantiate() as Node3D
-	if inst == null:
-		return
-	parent.add_child(inst)
-	for child in inst.get_children():
-		inst.remove_child(child)
-		if child is Node:
-			(child as Node).owner = null
-		parent.add_child(child)
-	inst.queue_free()
+func _attach_model_contents(parent: Node3D, model_path: String) -> Array:
+	return _model_utils.attach_model_contents(parent, model_path)
 
 func _create_tree_node(pos: Vector3, square: Vector2i, level: int, support: Node3D) -> StaticBody3D:
 	var tree := StaticBody3D.new()
@@ -747,7 +912,8 @@ func _create_tree_node(pos: Vector3, square: Vector2i, level: int, support: Node
 	col.disabled = true
 	tree.add_child(col)
 
-	_attach_model_contents(tree, TREE_MODEL_PATH)
+	var tree_visuals := _attach_model_contents(tree, TREE_MODEL_PATH)
+	_normalize_model_nodes(tree, tree_visuals)
 
 	return tree
 
@@ -756,16 +922,30 @@ func _create_boulder_node(pos: Vector3, square: Vector2i, level: int, support: N
 	boulder.add_to_group(GROUP_BUILD_BOULDER)
 	_tag_build_object(boulder, "boulder", square, level, support)
 	boulder.position = pos
+	boulder.rotation.y = randf_range(0.0, TAU)
 
 	var shape := CollisionShape3D.new()
 	var box := BoxShape3D.new()
-	box.size = Vector3(1.02, 1.0, 1.02)
+	box.size = Vector3(1.2342, BOULDER_HEIGHT, 1.2342)
 	shape.shape = box
 	boulder.add_child(shape)
 
-	_attach_model_contents(boulder, BOULDER_MODEL_PATH)
+	var boulder_visuals := _attach_model_contents(boulder, BOULDER_MODEL_PATH)
+	_scale_model_nodes(boulder_visuals, BOULDER_VISUAL_SCALE)
+	_normalize_model_nodes(boulder, boulder_visuals)
+	for visual in boulder_visuals:
+		var visual_node := visual as Node3D
+		if visual_node == null:
+			continue
+		visual_node.position.y -= BOULDER_HALF_HEIGHT
 
 	return boulder
+
+func _scale_model_nodes(nodes: Array, scale_factor: float) -> void:
+	_model_utils.scale_nodes(nodes, scale_factor)
+
+func _normalize_model_nodes(parent: Node3D, nodes: Array) -> void:
+	_model_utils.center_and_ground_nodes(parent, nodes)
 
 func _create_robot_node(pos: Vector3, yaw: float, square: Vector2i, level: int, support: Node3D) -> StaticBody3D:
 	var robot := StaticBody3D.new()
@@ -784,7 +964,9 @@ func _create_robot_node(pos: Vector3, yaw: float, square: Vector2i, level: int, 
 	body_col.disabled = true
 	robot.add_child(body_col)
 
-	_attach_model_contents(robot, ROBOT_MODEL_PATH)
+	var robot_visuals := _attach_model_contents(robot, ROBOT_MODEL_PATH)
+	_scale_model_nodes(robot_visuals, ROBOT_VISUAL_SCALE)
+	_normalize_model_nodes(robot, robot_visuals)
 
 	return robot
 
@@ -831,7 +1013,7 @@ func _get_place_target(hit: Dictionary) -> Dictionary:
 			return {}
 		return {
 			"square": b_square,
-			"pos": top_boulder.global_position + Vector3(0, 0.5, 0),
+			"pos": top_boulder.global_position + Vector3(0, BOULDER_HALF_HEIGHT, 0),
 			"level": 1,
 			"support": top_boulder,
 		}
@@ -841,7 +1023,7 @@ func _get_place_target(hit: Dictionary) -> Dictionary:
 		var p_square := _node_square(pedestal)
 		return {
 			"square": p_square,
-			"pos": pedestal.global_position + Vector3(0, 0.8, 0),
+			"pos": pedestal.global_position + Vector3(0, 1.04, 0),
 			"level": 0,
 			"support": null,
 		}
@@ -854,7 +1036,7 @@ func _get_place_target(hit: Dictionary) -> Dictionary:
 	if top_boulder_on_square != null:
 		return {
 			"square": square,
-			"pos": top_boulder_on_square.global_position + Vector3(0, 0.5, 0),
+			"pos": top_boulder_on_square.global_position + Vector3(0, BOULDER_HALF_HEIGHT, 0),
 			"level": 1,
 			"support": top_boulder_on_square,
 		}
@@ -907,7 +1089,7 @@ func _try_place_boulder() -> void:
 	if not _try_spend_energy(ENERGY_BOULDER):
 		return
 
-	var pos := (target["pos"] as Vector3) + Vector3(0, 0.5, 0)
+	var pos := (target["pos"] as Vector3) + Vector3(0, BOULDER_HALF_HEIGHT, 0)
 	var boulder := _create_boulder_node(pos, target["square"], int(target["level"]), target["support"])
 	_build_root.add_child(boulder)
 
@@ -1228,6 +1410,23 @@ func watcher_can_see_player_proxy(watcher: Node3D, head_pos: Vector3, forward: V
 	var robot_pos := _active_robot_proxy_position()
 	var target_pos := robot_pos + Vector3(0, 0.85, 0)
 	return _watcher_can_see_unobstructed_point(head_pos, forward, target_pos, scan_range, cone_threshold, watcher)
+
+func watcher_can_see_player_support(watcher: Node3D, head_pos: Vector3, forward: Vector3, scan_range: float, cone_threshold: float) -> bool:
+	if watcher == null or _active_robot == null or not is_instance_valid(_active_robot):
+		return false
+
+	var square := _player_occupied_square()
+	for boulder in _player_support_boulders(square):
+		if boulder != null and is_instance_valid(boulder):
+			if _watcher_can_see_target_point(head_pos, forward, _watcher_target_aim_point(boulder), scan_range, cone_threshold, watcher, boulder):
+				return true
+
+	for corner in _player_square_corner_points(square):
+		if _watcher_can_see_ground_point(head_pos, forward, corner, scan_range, cone_threshold, watcher):
+			return true
+
+	return false
+
 func watcher_can_see_player_proxy_ground(watcher: Node3D, head_pos: Vector3, forward: Vector3, scan_range: float, cone_threshold: float) -> bool:
 	if watcher == null:
 		return false
@@ -1241,6 +1440,36 @@ func watcher_can_see_player_proxy_ground(watcher: Node3D, head_pos: Vector3, for
 	var square := _world_to_square(_active_robot_proxy_position())
 	var ground_point := _watcher_ground_point_for_square(square)
 	return _watcher_can_see_ground_point(head_pos, forward, ground_point, scan_range, cone_threshold, watcher)
+
+func _player_support_boulders(square: Vector2i) -> Array[Node3D]:
+	var supports: Array[Node3D] = []
+	var current := _get_base_object_at(square)
+	while current != null:
+		var kind := String(current.get_meta("object_kind", ""))
+		if kind != "boulder":
+			break
+		supports.append(current)
+		var stacked := _get_stacked_on_boulder(current)
+		if stacked == null:
+			break
+		current = stacked
+	return supports
+
+func _player_square_corner_points(square: Vector2i) -> Array[Vector3]:
+	var tile := _get_tile_size()
+	var origin := _get_terrain_origin()
+	var inset := minf(tile * 0.08, 0.12)
+	var x0 := origin.x + float(square.x) * tile + inset
+	var x1 := origin.x + float(square.x + 1) * tile - inset
+	var z0 := origin.z + float(square.y) * tile + inset
+	var z1 := origin.z + float(square.y + 1) * tile - inset
+
+	return [
+		Vector3(x0, _square_ground_y(square) + 0.05, z0),
+		Vector3(x1, _square_ground_y(square) + 0.05, z0),
+		Vector3(x0, _square_ground_y(square) + 0.05, z1),
+		Vector3(x1, _square_ground_y(square) + 0.05, z1),
+	]
 
 func watcher_is_absorb_cooling(watcher: Node3D) -> bool:
 	if watcher == null:
@@ -1437,14 +1666,13 @@ func _degrade_object_one_energy(node: Node3D) -> void:
 		return
 
 	if kind == "robot":
-		var boulder := _create_boulder_node(node.position + Vector3(0, 0.5, 0), square, level, support)
-		boulder.rotation = node.rotation
+		var boulder := _create_boulder_node(node.position + Vector3(0, BOULDER_HALF_HEIGHT, 0), square, level, support)
 		_build_root.add_child(boulder)
 		node.queue_free()
 		return
 
 	if kind == "boulder":
-		var tree := _create_tree_node(node.position - Vector3(0, 0.5, 0), square, level, support)
+		var tree := _create_tree_node(node.position - Vector3(0, BOULDER_HALF_HEIGHT, 0), square, level, support)
 		tree.rotation = node.rotation
 		_build_root.add_child(tree)
 		node.queue_free()
@@ -1552,7 +1780,8 @@ func _convert_tree_to_meanie(tree: Node3D) -> void:
 	tree.set("scan_range", 24.0)
 	tree.set("cone_dot_threshold", 0.84)
 
-	_attach_model_contents(tree, MEANIE_MODEL_PATH)
+	var meanie_visuals := _attach_model_contents(tree, MEANIE_MODEL_PATH)
+	_normalize_model_nodes(tree, meanie_visuals)
 
 func _update_watcher_pressure(delta: float) -> void:
 	if _won:

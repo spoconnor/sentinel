@@ -36,19 +36,22 @@ func _process(delta: float) -> void:
 
 	var body_point := _player_body_target_point()
 	var sees_body := false
-	if _is_within_horizontal_view(head_pos, forward, body_point, scan_range, cone_dot_threshold):
+	if _is_within_view(head_pos, forward, body_point, scan_range, cone_dot_threshold):
 		sees_body = _has_line_of_sight_to_player(head_pos, body_point, "body")
 	else:
 		_debug_last_body_hit = "out-of-view"
 
 	var sees_head := false
-	if _player_head != null and _is_within_horizontal_view(head_pos, forward, _player_head.global_position, scan_range, cone_dot_threshold):
+	if _player_head != null and _is_within_view(head_pos, forward, _player_head.global_position, scan_range, cone_dot_threshold):
 		sees_head = _has_line_of_sight_to_player(head_pos, _player_head.global_position, "head")
 	else:
 		_debug_last_head_hit = "out-of-view"
 
-	var sees_player := sees_body or sees_head
-	var sees_square := sees_player
+	var sees_direct_player := sees_body or sees_head
+	var sees_square := false
+	if sees_direct_player and _player != null and _player.has_method("watcher_can_see_player_support"):
+		sees_square = bool(_player.call("watcher_can_see_player_support", self, head_pos, forward, scan_range, cone_dot_threshold))
+	var sees_player := sees_direct_player and sees_square
 
 	if not sees_player and _player != null and _player.has_method("watcher_can_see_player_proxy"):
 		var proxy_player_visible := bool(_player.call("watcher_can_see_player_proxy", self, head_pos, forward, scan_range, cone_dot_threshold))
@@ -105,8 +108,11 @@ func _is_within_horizontal_view(origin: Vector3, forward: Vector3, point: Vector
 	var target_dir := flat_to / flat_distance
 	return forward_dir.dot(target_dir) > horizontal_dot_threshold
 
+func _is_within_view(origin: Vector3, forward: Vector3, point: Vector3, max_distance: float, horizontal_dot_threshold: float) -> bool:
+	return _is_within_horizontal_view(origin, forward, point, max_distance, horizontal_dot_threshold)
+
 func _can_see_point(point: Vector3, head_pos: Vector3, forward: Vector3, exclude_nodes: Array, target: Node3D = null) -> bool:
-	if not _is_within_horizontal_view(head_pos, forward, point, scan_range, cone_dot_threshold):
+	if not _is_within_view(head_pos, forward, point, scan_range, cone_dot_threshold):
 		return false
 	return _has_line_of_sight(head_pos, point, exclude_nodes, target)
 
@@ -136,11 +142,13 @@ func _has_line_of_sight_to_player(from: Vector3, to: Vector3, debug_slot: String
 			_debug_last_head_hit = "no-player"
 		return false
 
-	var ray_start := from
 	var ray_dir := (to - from).normalized()
+	var ray_start := from + ray_dir * 0.12
 	var exclude_rids: Array = []
+	if has_method("get_rid"):
+		exclude_rids.append(call("get_rid"))
 
-	for _attempt in range(2):
+	for _attempt in range(3):
 		var p := PhysicsRayQueryParameters3D.create(ray_start, to)
 		p.collide_with_areas = false
 		p.collide_with_bodies = true
@@ -164,11 +172,12 @@ func _has_line_of_sight_to_player(from: Vector3, to: Vector3, debug_slot: String
 		if collider == null:
 			return false
 
-		# If we hit our own watcher body first, ignore it once and continue.
-		if collider == self or self.is_ancestor_of(collider):
+		# Ignore our own collision and the Sentinel's support pedestal so they don't
+		# block line-of-sight checks toward the player.
+		if _should_ignore_los_blocker(collider):
 			if collider.has_method("get_rid"):
 				exclude_rids.append(collider.call("get_rid"))
-			ray_start = (hit.get("position", ray_start) as Vector3) + ray_dir * 0.05
+			ray_start = (hit.get("position", ray_start) as Vector3) + ray_dir * 0.12
 			continue
 
 		var current := collider
@@ -179,6 +188,20 @@ func _has_line_of_sight_to_player(from: Vector3, to: Vector3, debug_slot: String
 		return false
 
 	return false
+
+func _should_ignore_los_blocker(collider: Node) -> bool:
+	if collider == null:
+		return false
+	if collider == self or self.is_ancestor_of(collider):
+		return true
+
+	var kind := String(collider.get_meta("object_kind", ""))
+	if kind != "pedestal":
+		return false
+
+	var own_x := int(get_meta("grid_x", -1))
+	var own_z := int(get_meta("grid_z", -1))
+	return int(collider.get_meta("grid_x", -2)) == own_x and int(collider.get_meta("grid_z", -2)) == own_z
 	
 func _player_body_target_point() -> Vector3:
 	if _player == null:
@@ -233,18 +256,11 @@ func _create_debug_vision_mesh() -> void:
 	if head_pivot == null or _debug_vision_mesh != null:
 		return
 	var half_angle := acos(clamp(cone_dot_threshold, -1.0, 1.0))
-	var cone_radius := tan(half_angle) * scan_range
-	cone_radius = maxf(cone_radius, 0.2)
 
 	_debug_vision_mesh = MeshInstance3D.new()
 	_debug_vision_mesh.name = "DebugVisionCone"
-	var cone := CylinderMesh.new()
-	cone.top_radius = 0.02
-	cone.bottom_radius = cone_radius
-	cone.height = scan_range
-	_debug_vision_mesh.mesh = cone
-	_debug_vision_mesh.position = Vector3(0, 0, -scan_range * 0.5)
-	_debug_vision_mesh.rotation_degrees = Vector3(90, 0, 0)
+	_debug_vision_mesh.mesh = _build_debug_sector_mesh(scan_range, half_angle)
+	_debug_vision_mesh.position = Vector3(0, 0.05, 0)
 
 	var mat := StandardMaterial3D.new()
 	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
@@ -255,6 +271,26 @@ func _create_debug_vision_mesh() -> void:
 	_debug_vision_mesh.material_override = mat
 	_debug_vision_mesh.visible = false
 	head_pivot.add_child(_debug_vision_mesh)
+
+func _build_debug_sector_mesh(radius: float, half_angle: float) -> ArrayMesh:
+	var mesh := ArrayMesh.new()
+	var st := SurfaceTool.new()
+	var segments := maxi(12, int(ceil(rad_to_deg(half_angle * 2.0))))
+
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var center := Vector3.ZERO
+	for i in range(segments):
+		var t0 := -half_angle + (float(i) / float(segments)) * (half_angle * 2.0)
+		var t1 := -half_angle + (float(i + 1) / float(segments)) * (half_angle * 2.0)
+		var p0 := Vector3(sin(t0) * radius, 0.0, -cos(t0) * radius)
+		var p1 := Vector3(sin(t1) * radius, 0.0, -cos(t1) * radius)
+
+		st.add_vertex(center)
+		st.add_vertex(p1)
+		st.add_vertex(p0)
+
+	mesh = st.commit()
+	return mesh
 
 func _update_debug_vision_visibility() -> void:
 	if _debug_vision_mesh == null:
